@@ -1,0 +1,476 @@
+"""Nimbus configuration.
+
+Loads environment variables from .env (BYOK pattern) AND from
+the OS keyring (Windows Credential Manager via the keyring
+package, DPAPI per-user encryption). On launch with .env present, the
+keys are auto-migrated to the keyring as a backup; user can then delete
+.env without losing the keys.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import keyring
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# ── Secrets resolution (env → keyring with one-shot migration) ──────────────
+
+KEYRING_SERVICE: str = "nimbus"
+"""Service name for keyring entries. Windows Credential Manager treats this
+as the namespace key. All Nimbus API keys live under this single service
+name; the ``name`` parameter is the env-var name (ANTHROPIC_API_KEY, etc.)."""
+
+
+def resolve_api_key(name: str) -> str | None:
+    """Resolve an API key by name, preferring env var then keyring.
+
+    On env-var-present, ALSO write the value to keyring as a backup —
+    this is the one-shot migration path from the ``.env`` workflow
+    to keyring storage. Subsequent launches with no .env will
+    pick up the value from keyring transparently.
+
+    Failures in keyring (locked vault, no backend, transient errors)
+    are swallowed — the env-var path always works as a fallback. We
+    never want a credential-store glitch to block app startup when the
+    user has perfectly valid keys in their .env.
+
+    Returns None if neither source has a value (caller shows the
+    first-launch settings dialog).
+    """
+    env_value = os.getenv(name)
+    if env_value:
+        try:
+            keyring.set_password(KEYRING_SERVICE, name, env_value)
+        except Exception:
+            # Keyring backend unreachable; env value is still good.
+            pass
+        return env_value
+    try:
+        return keyring.get_password(KEYRING_SERVICE, name)
+    except Exception:
+        return None
+
+
+def resolve_setting(name: str, default: str) -> str:
+    """Resolve a non-secret setting by name with env→keyring→default fallback.
+
+    Sibling to ``resolve_api_key`` for config knobs (TTS_PROVIDER,
+    LLM_PROVIDER, STT_PROVIDER, etc.) that need keyring persistence so
+    bundled-EXE startup doesn't silently fall back to defaults when the
+    user's `.env` doesn't load (cwd is install dir, not repo root).
+
+    Differs from resolve_api_key in that it always returns a string —
+    callers pass the right default for the setting (e.g. "cartesia" for
+    TTS_PROVIDER) rather than handling None.
+
+    Failures in keyring (locked vault, no backend) are swallowed in both
+    directions: env path always returns successfully even if keyring write
+    fails; keyring read errors fall through to the default.
+    """
+    env_value = os.getenv(name)
+    if env_value:
+        try:
+            keyring.set_password(KEYRING_SERVICE, name, env_value)
+        except Exception:
+            pass
+        return env_value
+    try:
+        stored = keyring.get_password(KEYRING_SERVICE, name)
+    except Exception:
+        stored = None
+    return stored if stored else default
+
+
+# ── API keys ─────────────────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY: str | None = resolve_api_key("ANTHROPIC_API_KEY")
+"""Optional. Only needed when the Anthropic provider is selected. Plain
+vision streaming via messages.stream()."""
+
+ASSEMBLYAI_API_KEY: str | None = resolve_api_key("ASSEMBLYAI_API_KEY")
+"""Needed only when STT_PROVIDER=assemblyai (the cloud STT option). Streaming
+STT via AssemblyAI u3-rt-pro WebSocket + ForceEndpoint for ~150ms P50 PTT
+finalization. Free credit at https://www.assemblyai.com/dashboard/signup.
+The local faster-whisper option needs no key."""
+
+CARTESIA_API_KEY: str | None = resolve_api_key("CARTESIA_API_KEY")
+"""Needed only when TTS_PROVIDER=cartesia (a cloud TTS option). Streaming TTS
+via Cartesia Sonic-3 WebSocket with ~150-250ms TTFB + expressive voice. Free
+credits/month at https://play.cartesia.ai/sign-in. The local Kokoro option
+needs no key."""
+
+OPENAI_API_KEY: str | None = resolve_api_key("OPENAI_API_KEY")
+"""OpenAI native API key (sk-...) for the default OpenAI LLM provider — GPT
+vision in the normal pipeline (model set via OPENAI_MODEL_VISION), and
+GPT-Realtime speech-to-speech as a separate path. Selected via
+LLM_PROVIDER='openai' (default) or 'openai-realtime'. You can also paste an
+OpenRouter sk-or- key. Get a native key at
+https://platform.openai.com/api-keys."""
+
+
+# ── OpenRouter dual-SDK routing (BYOK, model-agnostic) ──────────────────────
+
+OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+"""OpenRouter's OpenAI-compatible endpoint for Gemini / Grok / Llama / etc.
+
+The existing ANTHROPIC_BASE_URL env var (read natively by the Anthropic SDK)
+points at 'https://openrouter.ai/api' for Nimbus models. This constant is the
+sibling endpoint for the OpenAI SDK used by GeminiClient (ai.py). Same API
+key (ANTHROPIC_API_KEY from .env — which is actually the OpenRouter
+sk-or-v1-... key when ANTHROPIC_BASE_URL is set to OpenRouter)."""
+
+
+# ── LLM model ID (routed by prefix via ai.create_ai_client) ─────────────────
+
+MODEL_ID: str = os.getenv("MODEL_ID", "openai/gpt-4o")
+"""OpenRouter-style model ID. Prefix routes to the right SDK via
+ai.create_ai_client():
+    'anthropic/...'  → AnthropicClient (via anthropic SDK, OpenRouter
+                        Anthropic-compat endpoint)
+    'google/...'     → GeminiClient (via openai SDK, OpenRouter OpenAI-compat
+                        endpoint)
+    'openai/...'     → OpenAIVisionClient (via openai SDK, api.openai.com)
+
+Defaults to 'openai/gpt-4o'. Set MODEL_ID in .env to override."""
+
+
+# ── Screen capture ───────────────────────────────────────────────────────────
+
+CANDIDATE_RESOLUTIONS: list[tuple[int, int]] = [
+    (1024, 768),   # 4:3   = 1.333 (legacy displays)
+    (1280, 800),   # 16:10 = 1.600 (most laptops)
+    (1366, 768),   # ~16:9 = 1.779 (external monitors, ultrawide fallback)
+]
+"""Recommended screenshot resolutions. capture.py picks the
+closest-aspect-ratio pair to the actual monitor to avoid distortion
+(max dimension 1280)."""
+
+
+# ── Hotkey ───────────────────────────────────────────────────────────────────
+
+HOTKEY: str = os.getenv("HOTKEY", "ctrl+alt+space")
+"""Default push-to-talk hotkey. Ctrl+Alt+Space because:
+
+  1. Alt+Space alone conflicts with the Windows window menu + Copilot
+     (Microsoft reassigned it in Windows 11). Making it work
+     cleanly needs Win32 RegisterHotKey + GetAsyncKeyState polling for
+     release detection -- 8-12h of fragile ctypes code, deferred as a
+     future drop-in subclass.
+  2. Ctrl+Shift+Space was an earlier pivot target but conflicts with
+     Microsoft Excel + Google Sheets "Select entire worksheet" binding.
+     Because our pynput listener uses suppress=False (observe-only),
+     the spreadsheet underneath ALSO receives the keypress and wipes
+     the user's selection every time they invoke Nimbus -- unacceptable
+     when working in a spreadsheet.
+  3. Fn+Space is firmware-level (handled by the keyboard EC below the
+     OS) and invisible to WH_KEYBOARD_LL + pynput. Non-portable even
+     where it happens to work. AutoHotkey docs: "the Fn key does not
+     (as a general rule) generate any scan code that can be used."
+  4. Ctrl+Alt+Space has no known code-level conflicts (Excel, Sheets,
+     Windows menu, Copilot, VS Code all clear). Three-finger but all on
+     the left side of the keyboard for one-handed ergonomics. suppress=
+     False observe-only model carries over unchanged.
+
+  KNOWN SETUP REQUIREMENT: if another app already binds Ctrl+Alt+Space
+  (for example a launcher or assistant with a global quick-access
+  shortcut), disable that binding — Nimbus's listener is observe-only,
+  so both apps receive the keypress otherwise and the other app's popup
+  will appear every time you invoke Nimbus. A future Win32 RegisterHotKey
+  approach could claim the combo at the OS level to eliminate the conflict.
+
+NEVER ctrl+space (VS Code IntelliSense conflict -- still rejected)."""
+
+
+# ── STT (AssemblyAI u3-rt-pro streaming) ─────────────────────────────────────
+
+ASSEMBLYAI_SPEECH_MODEL: str = "u3-rt-pro"
+"""AssemblyAI Universal-3 realtime-pro streaming model.
+~150ms P50 finalization after ForceEndpoint message on hotkey release."""
+
+ASSEMBLYAI_STREAMING_URL: str = "wss://streaming.assemblyai.com/v3/ws"
+"""AssemblyAI streaming WebSocket endpoint. Query params are set via SDK."""
+
+AUDIO_SAMPLE_RATE: int = 16_000
+"""PCM16 mono at 16kHz. Matches AssemblyAI u3-rt-pro's required sample rate +
+Nimbus's audio pipeline + the canonical input shape for every major
+streaming STT provider."""
+
+AUDIO_CHUNK_FRAMES: int = 1024
+"""sounddevice RawInputStream blocksize. 1024 frames keeps the streaming
+WebSocket payload shape consistent across provider swaps."""
+
+# ── Audio level (RMS) filter — drives the waveform widget ──────────────────
+
+AUDIO_POWER_BOOST: float = 10.2
+"""Multiplier applied to per-chunk RMS before clamping to [0, 1]. Tuned to
+make normal speech register ~0.4-0.8 on the waveform. Tuned empirically."""
+
+AUDIO_POWER_DECAY: float = 0.72
+"""Exponential decay floor between chunks: smoothed = max(raw, old * 0.72).
+Prevents the UI waveform from jumping DOWN sharply at natural speech pauses —
+makes the meter feel responsive to loud sounds but stable at quiet ones."""
+
+
+# ── TTS (Cartesia Sonic-3 WebSocket streaming) ──────────────────────────────
+
+CARTESIA_MODEL_ID: str = "sonic-3"
+"""Cartesia's state-space-model-based TTS. ~90ms model-internal TTFB,
+150-250ms real-world through the WebSocket stream + sounddevice playback.
+Most expressive 'buddy' voice quality in the cloud TTS field today."""
+
+CARTESIA_VOICE_ID: str = os.getenv(
+    "CARTESIA_VOICE_ID",
+    "f786b574-daa5-4673-aa0c-cbe3e8534c02",  # "Katie - Friendly Fixer" — Cartesia-recommended for voice agents
+)
+"""Cartesia voice ID for Sonic-3. The default is a warm, conversational
+adult female voice that fits the "buddy next to you" UX.
+
+Swap via .env CARTESIA_VOICE_ID=... to use a different voice. Other strong
+candidates from the Cartesia catalog:
+  - e8e5fffb-252c-436d-b842-8879b84445b6 — nice young adult female, casual
+  - db6b0ed5-d5d3-463d-ae85-518a07d3c2b4 — approachable American female
+  - a33f7a4c-100f-41cf-a1fd-5822e8fc253f — expressive, narration/storytelling
+  - f786b574-daa5-4673-aa0c-cbe3e8534c02 — enunciating, conversational support
+"""
+
+CARTESIA_OUTPUT_SAMPLE_RATE: int = 44_100
+"""Cartesia output stream sample rate. 44.1 kHz PCM float32 via sounddevice
+OutputStream. Cartesia supports 22.05k / 44.1k / 48k — 44.1k is the most
+natural for buddy voice without oversampling cost."""
+
+
+# ── Provider selection (which subclass app.py constructs at startup) ────────
+
+LLM_PROVIDER: str = resolve_setting("LLM_PROVIDER", default="openai")
+"""Which AIClient subclass to construct. Defaults to "openai"; other
+providers (Anthropic, Gemini, Ollama) are selectable in the Settings
+dialog or via a MODEL_ID env override."""
+
+STT_PROVIDER: str = resolve_setting("STT_PROVIDER", default="assemblyai")
+"""Which STT subclass to construct: "assemblyai" (cloud) or
+"faster-whisper" (local)."""
+
+TTS_PROVIDER: str = resolve_setting("TTS_PROVIDER", default="cartesia")
+"""Which TTS subclass to construct: "cartesia" or "elevenlabs" (cloud),
+or "kokoro" (local). User switches via the Settings dialog dropdown."""
+
+ANNOTATION_MODE: str = resolve_setting("ANNOTATION_MODE", default="off")
+"""Draw-on-screen teaching mode. When 'on', the vision
+model is given the annotation system prompt and emits
+[ARROW]/[CIRCLE]/[UNDERLINE]/[LABEL] tags that the overlay renders as shapes
+(in ADDITION to the [POINT] cursor). When 'off' (default) Nimbus behaves
+exactly as before — nothing is overridden. Accuracy comes from the model
+(Nimbus is natively precise; GPT-4o/Ollama selectable). Resolved ONCE here at
+import (env→keyring→default); app.py reads this cached constant per interaction
+rather than calling resolve_setting on the hot path, so there is no
+per-interaction keyring read/write latency. Set it in .env and restart to
+toggle."""
+
+
+# ── ElevenLabs TTS (opt-in alternative to Cartesia) ─────────────────────────
+
+ELEVENLABS_API_KEY: str | None = resolve_api_key("ELEVENLABS_API_KEY")
+"""Optional. Required only when TTS_PROVIDER='elevenlabs'. 10k chars/month
+free tier at https://elevenlabs.io/app/sign-up — no credit card."""
+
+ELEVENLABS_MODEL_ID: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+"""ElevenLabs Flash v2.5 — ~75ms model TTFB. ElevenLabs officially
+recommends Flash over Turbo v2.5 for low-latency voice agents.
+Verified against ElevenLabs Python SDK 2.45.0 (
+``client.text_to_speech.stream`` accepts ``model_id="eleven_flash_v2_5"``).
+"""
+
+ELEVENLABS_VOICE_ID: str = os.getenv(
+    "ELEVENLABS_VOICE_ID",
+    "21m00Tcm4TlvDq8ikWAM",  # Rachel — American female, conversational
+)
+"""ElevenLabs voice ID for the buddy persona. Default Rachel matches
+Cartesia "Brooke - Big Sister" warmth (conversational adult female).
+Verified against ElevenLabs voice catalog
+(https://elevenlabs.io/app/voice-library) — Rachel's official voice ID
+is ``21m00Tcm4TlvDq8ikWAM``. If swapping to a different voice via env
+override, copy the ID from the voice library page (NOT the URL slug)."""
+
+ELEVENLABS_OUTPUT_SAMPLE_RATE: int = int(
+    os.getenv("ELEVENLABS_OUTPUT_SAMPLE_RATE", "22050")
+)
+"""ElevenLabs PCM sample rate. Defaulted to 22050 because 44.1kHz PCM
+requires Pro tier. ElevenLabs PCM is int16 (NOT float32 like Cartesia),
+so playback path converts inline: np.frombuffer(chunk, np.int16).astype(
+np.float32) / 32768.0."""
+
+
+# ── Ollama (local LLM via Ollama server) ─────────────────────────────
+
+OLLAMA_HOST: str = os.getenv(
+    "OLLAMA_HOST", resolve_setting("OLLAMA_HOST", "http://localhost:11434")
+)
+"""Local Ollama server URL. Default matches Ollama's out-of-the-box
+``ollama serve`` binding. Set in .env or Settings dialog to point at a
+different host (e.g. another machine on LAN). Supports unauthenticated
+local Ollama — no API-key field needed."""
+
+OLLAMA_MODEL_VISION: str = os.getenv(
+    "OLLAMA_MODEL_VISION",
+    resolve_setting("OLLAMA_MODEL_VISION", "llava:7b"),
+)
+"""Ollama vision-capable model used when screenshots are present.
+Default ``llava:7b`` works on every Ollama version with vision support
+(~4.5 GB). ``llama3.2-vision`` is more accurate but needs Ollama
+>=0.4.x (uses ``mllama`` arch). User can switch via Settings dialog;
+``ollama_health.check_model_compatibility`` warns on mismatch."""
+
+OLLAMA_MODEL_TEXT: str = os.getenv(
+    "OLLAMA_MODEL_TEXT",
+    resolve_setting("OLLAMA_MODEL_TEXT", "llama3.2"),
+)
+"""Ollama text-only model used when no screenshots are sent (rare in
+Nimbus's PTT flow but kept for parity with the vision/text split).
+Defaults to plain ``llama3.2`` (3B, ~2 GB)."""
+
+
+# ── OpenAI (native API — gpt-5.4 vision + GPT-Realtime) ──────────────
+
+OPENAI_MODEL_VISION: str = os.getenv(
+    "OPENAI_MODEL_VISION",
+    resolve_setting("OPENAI_MODEL_VISION", "gpt-5.4"),
+)
+# gpt-5.4 is pixel-accurate at GUI grounding (85.4% on ScreenSpot-Pro) and
+# returns precise [POINT] tags directly, so the OpenAI vision path does not
+# need the grid-locator (it auto-skips when a [POINT] tag is present). Set
+# OPENAI_MODEL_VISION in .env to override (e.g. =gpt-4o).
+"""OpenAI vision model for the normal pipeline (LLM_PROVIDER='openai').
+Defaults to gpt-5.4, which is pixel-accurate at grounding and emits
+[POINT:x,y:label] directly. Weaker models (e.g. gpt-4o) can fall back to
+the two-stage grid-locator (locator.py) for pointing. Routed via the
+``openai/`` MODEL_ID prefix in create_ai_client."""
+
+OPENAI_REALTIME_MODEL: str = os.getenv(
+    "OPENAI_REALTIME_MODEL",
+    resolve_setting("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
+)
+"""OpenAI GPT-Realtime model for the speech-to-speech path
+(LLM_PROVIDER='openai-realtime'). ``gpt-realtime-2`` is GPT-5-class,
+continuous-stream voice — near-zero latency, sees the screenshot, reasons,
+and emits a pointing target via the point_at function call. This path
+bypasses the STT→AIClient→TTS chain entirely (realtime.py owns the
+WebSocket session + audio I/O). Coordinates are refined via the
+grid-locator, same as the GPT-4o path."""
+
+
+# -- Local STT (faster-whisper, opt-in offline, no API key) ------------------
+
+FASTER_WHISPER_MODEL: str = os.getenv(
+    "FASTER_WHISPER_MODEL", resolve_setting("FASTER_WHISPER_MODEL", "base.en")
+)
+"""faster-whisper model size. 'base.en' is the low-latency English default
+(~150MB, downloads to the HF cache on first use). 'small.en' is more accurate
+but slower. Local offline STT needs no API key."""
+
+FASTER_WHISPER_DEVICE: str = os.getenv(
+    "FASTER_WHISPER_DEVICE", resolve_setting("FASTER_WHISPER_DEVICE", "cpu")
+)
+"""'cpu' (portable default) or 'cuda' if the user has an NVIDIA GPU."""
+
+FASTER_WHISPER_COMPUTE: str = os.getenv(
+    "FASTER_WHISPER_COMPUTE", resolve_setting("FASTER_WHISPER_COMPUTE", "int8")
+)
+"""CTranslate2 compute type. 'int8' is fast + low-memory on CPU."""
+
+
+# -- Local TTS (Kokoro-82M via ONNX, opt-in offline, no API key) -------------
+
+KOKORO_VOICE: str = os.getenv("KOKORO_VOICE", resolve_setting("KOKORO_VOICE", "af_heart"))
+"""Kokoro voice id. 'af_heart' is a warm conversational female voice."""
+
+KOKORO_OUTPUT_SAMPLE_RATE: int = 24_000
+"""Kokoro-82M output sample rate (24kHz float32)."""
+
+_DEFAULT_KOKORO_DIR = Path.home() / ".nimbus" / "kokoro"
+KOKORO_CACHE_DIR: Path = Path(os.getenv("KOKORO_CACHE_DIR", str(_DEFAULT_KOKORO_DIR)))
+"""Where the Kokoro onnx + voices files download on first use (~336MB total)."""
+
+
+# -- Google Gemini (cloud vision via OpenRouter) ------------------
+
+GEMINI_API_KEY: str | None = resolve_api_key("GEMINI_API_KEY")
+"""OpenRouter key (sk-or-) for Gemini. Get one at https://openrouter.ai/keys.
+Gemini routes through OpenRouter's OpenAI-compat endpoint (see GeminiClient)."""
+
+GEMINI_MODEL_VISION: str = os.getenv(
+    "GEMINI_MODEL_VISION",
+    resolve_setting("GEMINI_MODEL_VISION", "google/gemini-3.1-pro-preview"),
+)
+"""Gemini model. Default is 'google/gemini-3.1-pro-preview' — the most
+pixel-accurate Gemini for pointing (84.4% ScreenSpot-Pro, the Pro tier).
+The default was chosen over 'google/gemini-3.5-flash' because Flash's
+coordinates were noticeably off in real use; there is no 3.5-pro, so the
+3.1 Pro preview is the strongest grounding option on OpenRouter. The full
+'-preview' suffix is the valid OpenRouter slug (bare 'google/gemini-3.1-pro'
+404s). Cheaper/faster alternative via env: GEMINI_MODEL_VISION=google/gemini-3.5-flash."""
+
+
+# ── Memory ───────────────────────────────────────────────────────────────────
+
+_DEFAULT_MEMORY_DIR = Path.home() / ".nimbus"
+
+MEMORY_DIR: Path = Path(os.getenv("MEMORY_DIR", str(_DEFAULT_MEMORY_DIR / "memory")))
+"""Where per-app markdown files live. One .md per Windows app executable."""
+
+INDEX_DB_PATH: Path = Path(os.getenv("INDEX_DB_PATH", str(_DEFAULT_MEMORY_DIR / "index.db")))
+"""SQLite index at ~/.nimbus/index.db. Fast lookup for apps + interaction counts."""
+
+INSIGHTS_PATH: Path = Path(os.getenv("INSIGHTS_PATH", str(_DEFAULT_MEMORY_DIR / "insights.md")))
+"""Path for an optional memory health-check summary."""
+
+MEMORY_RECALL_MAX_CHARS: int = 1500
+"""Max characters of recalled memory to inject into the user message per request.
+~1500 chars = last 5-6 interactions. Persistent per-app memory is a
+differentiator, but too much context slows the model down."""
+
+
+# ── Knowledge base (user-uploadable per-app curated docs) ────────────────────
+
+KB_DIR: Path = Path(
+    os.getenv("KB_DIR", str(Path.home() / "Documents" / "Nimbus Wiki"))
+)
+"""User drops a single .md file here per app, named to match the .exe
+basename (e.g. ``myapp.exe.md`` for MyApp, ``fusion360.exe.md`` for
+Fusion 360). Nimbus reads it on every PTT and injects as authoritative
+reference in Nimbus's system prompt.
+
+Default location is visible in File Explorer (NOT a hidden ``.``-prefixed
+folder) so users can find + edit + delete the files without terminal
+gymnastics. Mirrors memory.py's transparency contract: human-readable,
+hand-editable, no vector DB.
+
+A simple flat layout (one file per app), right-sized for this use case."""
+
+KB_RECALL_MAX_CHARS: int = 60_000
+"""Max characters of curated KB content to inject per request. ~15K
+tokens, ~⅓ of Nimbus's context budget. Over-budget files tail-truncate
+(same behavior as memory.recall). Anthropic supports up to 4
+``cache_control`` breakpoints per request; injecting KB adds a 2nd
+system block alongside the persona block, leaving 2 slots for the
+user-message memory prefix + the implicit automatic-cache slot."""
+
+
+# ── Overlay ──────────────────────────────────────────────────────────────────
+
+POINTER_ANIMATION_MS: int = 400
+"""QPropertyAnimation duration for pointer movement. 400ms feels responsive,
+not jittery."""
+
+
+# ── Latency targets ──────────────────────────────────────────────────────────
+
+E2E_LATENCY_BUDGET_S: float = 1.5
+"""Target perceived latency from hotkey release to first audible word.
+Expected breakdown: ~150ms STT (AssemblyAI ForceEndpoint) + ~500-800ms
+vision-model TTFT + ~200ms Cartesia Sonic-3 TTFB - ~300ms sentence-
+streaming overlap = ~800-1200ms."""
