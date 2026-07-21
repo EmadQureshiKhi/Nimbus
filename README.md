@@ -1,164 +1,189 @@
-<h1 align="center">Nimbus</h1>
-
 <p align="center">
-  A voice-driven, screen-aware AI buddy for Windows, powered by OpenAI. Hold a hotkey, ask anything about whatever app you are looking at, and Nimbus talks back and points at the answer with a blue cursor.
+  <img src="assets/nimbus%20logo%201.png" alt="Nimbus logo" width="260" />
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/license-MIT-f4d35e" alt="MIT" />
-  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4" alt="Windows 10/11" />
-  <img src="https://img.shields.io/badge/powered%20by-OpenAI-10a37f" alt="OpenAI" />
-  <a href="https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml"><img src="https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
-</p>
+# Nimbus
 
-## What it does
+> A voice-driven, screen-aware AI assistant for Windows that teaches you.
 
-You are working in some app. You hit a wall. You hold `Ctrl+Alt+Space`, ask a question out loud, release. A moment later you hear the answer, and a blue cursor lands on the exact button or menu item you needed to click.
+Nimbus is your on-screen AI study buddy and tutor for Windows. Hold a hotkey and ask about anything you see — a math problem, a paragraph in a PDF, a diagram, or how to use an app — and Nimbus reads your screen, answers out loud, and teaches you visually, circling and pointing to explain right where you're looking.
 
-A few ways to use it:
+[![Tests](https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml/badge.svg)](https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-f4d35e.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078d4.svg)](#setup--running-from-source)
 
-- **Live analysis of whatever is on screen.** *"What is this chart telling me?"* Nimbus reads the screen and walks you through it, pointing at the relevant spots.
-- **Niche or company-internal software the model does not know.** Drop a markdown file with the docs into `~/Documents/Nimbus Wiki/<app>.exe.md` and Nimbus becomes an expert, pointing at things like a TA who already read the manual.
-- **Learning a new tool or codebase.** Don't know what something does? Hit the hotkey, ask, Nimbus reads your editor and explains what is happening and where to click.
+## Education: software tutoring that sees the screen
 
-There is also a **teaching mode** (toggle *Draw on screen* in Settings). Instead of a single cursor, Nimbus marks up your screen the way a tutor would: it circles the thing you asked about, draws an arrow to it, underlines a term, and writes a short label, then clears them once you've read them.
+Nimbus is designed as a practical learning companion for software, not just a voice interface. A learner can keep working in the real application, ask a question aloud, and receive guidance in the context where it matters. In **Tutor mode**, Nimbus can draw circles, arrows, underlines, and short labels directly on the screen to show an action step by step.
 
-Everything runs through your own API key. Nothing routes through a proxy server. See [Privacy](#privacy) for the specifics.
+That is useful for:
 
-## Install Nimbus
+- **Students:** learn unfamiliar tools — coding environments, spreadsheets, design software, research tools, or learning platforms — without constantly switching to a tutorial video or searching for a menu by name.
+- **Teachers:** demonstrate a workflow and give contextual help while a student is actually using the tool, including hands-free situations where typing is inconvenient.
+- **Educational organizations:** add local, per-application knowledge in a Markdown knowledge-base folder and preserve per-app interaction memory, so guidance can become more useful for recurring software and workflows over time.
+- **Accessible learning:** voice input, spoken answers, visible pointers, and on-screen tutor annotations offer multiple ways to receive guidance.
 
-Nimbus supports Windows 10/11 on 64-bit PCs. You can either install a ready-to-run release or run it from this repository.
+Nimbus is screen-aware: it captures the active screen context, understands the question alongside that context, and can guide the learner to the relevant interface control rather than merely describing it in abstract terms.
 
-### Option A: install without the repository
+## Category
 
-1. Open the [Nimbus Releases page](https://github.com/EmadQureshiKhi/Nimbus/releases) and download the latest `Nimbus-Windows-Setup-v*.exe` file.
-2. Run the installer. It installs only for your Windows account, so it does not need administrator access.
-3. Leave **Run Nimbus** selected at the end of setup, or open Nimbus later from the Start menu or desktop shortcut.
-4. On first launch, choose your providers in Settings. The simplest setup is **OpenAI** for LLM, **faster-whisper (local)** for speech-to-text, and **Kokoro (local)** for speech output; enter only your OpenAI API key.
-5. Nimbus appears as a blue cursor icon in the Windows system tray. Right-click it for Settings, your knowledge/memory folders, session export, or Quit.
+**Education.** Nimbus fits the Education track because it teaches people how to use software in context: it observes the learning environment, explains the task aloud, and visually guides the next action on the learner's own screen.
 
-Nimbus checks GitHub Releases when it starts. When a newer version is published, it shows an **Update available** message; select **Open** to download the new installer and run it to update Nimbus.
+## How it works
 
-### Option B: run from this repository
+### Push-to-talk pipeline
 
-Requires Windows 10/11 and Python 3.13.
+1. Hold the configured hotkey (default: `Ctrl+Alt+Space`) and speak.
+2. On release, Nimbus finalizes speech-to-text while capturing the screen. It also recalls relevant per-app memory and, if present, the matching local knowledge-base Markdown file.
+3. The configured vision model receives the screenshot and context, then streams a response.
+4. Nimbus begins spoken output through the configured text-to-speech provider and, when appropriate, receives a `[POINT:x,y]` target for the UI.
+5. A per-monitor, click-through Qt overlay renders the pointer without stealing focus or blocking clicks.
+
+The overlay is DPI-aware and uses one window per physical monitor, which keeps physical screenshot coordinates and Qt logical coordinates aligned on mixed-DPI multi-monitor setups. It also provides the listening waveform, thinking spinner, tutor annotations, and non-blocking status/error toasts.
+
+### Grounding and tutor guidance
+
+Nimbus has two pointing routes:
+
+- **Direct model grounding:** the normal OpenAI vision route returns a precise `[POINT:x,y]` target directly.
+- **Two-stage grid-locator fallback:** when a model does not return direct coordinates, Nimbus asks it to identify a coarse numbered grid cell and then a finer sub-grid cell.
+
+For directional questions and targets near the cursor, Nimbus can run a high-detail crop verification/refinement pass around the candidate coordinate before drawing the pointer. This preserves the direct result when refinement is uncertain rather than replacing it with a guess.
+
+With **Tutor mode** enabled in Settings, the runtime model can return `[CIRCLE]`, `[ARROW]`, `[UNDERLINE]`, and `[LABEL]` geometry in addition to a point. Nimbus maps those annotations to the correct monitor and draws them temporarily on screen.
+
+### Local context and provider choices
+
+- **Persistent per-app memory:** `memory.py` stores human-readable Markdown per Windows executable and maintains a local SQLite index. Nimbus recalls recent context for the app currently in use.
+- **Knowledge base:** put a Markdown file named for an app in the Nimbus Knowledge Folder (for example, `EXCEL.EXE.md`) to supply local instructions or organizational documentation for that app.
+- **Pluggable providers:** OpenAI is the default LLM path. Settings can select OpenAI, Anthropic, Gemini/OpenRouter routing, Ollama, or OpenAI Realtime where configured; speech can use AssemblyAI or local faster-whisper; speech output can use Cartesia, ElevenLabs, or local Kokoro.
+- **Offline/privacy-oriented speech:** faster-whisper STT and Kokoro TTS are local options. With a local Ollama vision model as well, the main interaction path can run without cloud model providers.
+
+## Features
+
+- Push-to-talk voice interaction with a configurable hotkey.
+- Screen-aware spoken answers.
+- On-screen pointing with a click-through, per-monitor overlay.
+- Tutor mode with circles, arrows, underlines, and labels.
+- Direct coordinate grounding, grid fallback, and targeted verification/refinement for small UI targets.
+- Persistent per-app memory and a drop-in Markdown knowledge-base folder.
+- Session-history export to a timestamped Markdown file, including recent memory for the current app.
+- BYOK Settings stored through Windows Credential Manager, with optional `.env` setup for development.
+- Opt-in diagnostic capture with retention controls, plus a confirmed **Clear all Nimbus local data** control.
+- First-run welcome/permissions guidance and a one-time tray onboarding reminder.
+- Distinct listening, completion, and error audio cues; waveform/spinner state feedback; non-blocking in-overlay error toasts.
+- Tray controls for Settings, folder access, session export, push-to-talk pause/resume, and quit.
+- GitHub Actions tests, automated Windows installer releases, and an in-app update check.
+
+## Setup & running from source
+
+Nimbus is **Windows-only**. Use Windows and Python 3.13.
 
 ```powershell
-# 1. Clone the repository and enter it
+# Clone and enter the repository
 git clone https://github.com/EmadQureshiKhi/Nimbus.git
 cd Nimbus
 
-# 2. Create and activate a virtual environment
+# Create and activate a Python 3.13 virtual environment
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 3. Install dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# 4. Add your key (copy .env.example to .env and fill it in)
-#    Minimal setup: OpenAI for the LLM, local models for speech in/out.
-#      OPENAI_API_KEY=sk-...
-#      LLM_PROVIDER=openai
-#      STT_PROVIDER=faster-whisper   # local, no key
-#      TTS_PROVIDER=kokoro           # local, no key
-
-# 5. Run it
+# Run Nimbus
 py -3.13 -m app
 ```
 
-## Use Nimbus
+On first launch, Nimbus opens its Settings dialog. Choose providers and enter the required **bring-your-own keys**; settings and keys are stored in Windows Credential Manager.
 
-1. Start Nimbus. It runs from the **system tray** rather than opening a normal app window.
-2. Open the app or webpage you want help with and place your cursor near the relevant area.
-3. Hold `Ctrl+Alt+Space`, speak your question, then release the keys.
-4. Nimbus captures the screen, answers out loud, and moves its blue cursor to a relevant control when useful.
-5. Right-click the tray icon to change providers/keys, export the current session, open your knowledge folder, or quit.
+Alternatively, configure a development `.env` file:
 
-If another application already uses `Ctrl+Alt+Space`, change that application’s shortcut so Nimbus can receive the hotkey. Nimbus observes the combination and does not block normal typing.
+```powershell
+Copy-Item .env.example .env
+```
 
-On first run the local speech models download once (~150 MB for speech-to-text, ~330 MB for the voice), so the first interaction is slower. After that it is fast.
+Then edit `.env` with your provider choices and keys. The example uses OpenAI for vision and local faster-whisper/Kokoro speech providers. Never commit `.env`.
 
-## Build from source
+After Nimbus starts, it lives in the system tray. Right-click its icon for Settings and controls, then hold `Ctrl+Alt+Space` (or your configured hotkey), speak, and release to ask a question.
 
-Build the Windows onedir distributable from an activated Python 3.13 environment:
+## Install without the repo
+
+1. Go to [GitHub Releases](https://github.com/EmadQureshiKhi/Nimbus/releases).
+2. Download the latest `Nimbus-Windows-Setup-v*.exe` installer.
+3. Run it and launch Nimbus from the final installer screen, Start menu, or desktop shortcut.
+4. Complete the first-run Settings and welcome screens, then use the tray icon.
+
+Releases are built and published automatically by GitHub Actions after pushes to `main` pass the release workflow.
+
+The installer is currently unsigned. If Microsoft SmartScreen appears, choose **More info** and then **Run anyway** after confirming you downloaded the installer from the official Nimbus Releases page.
+
+## Build & release
+
+Build the PyInstaller onedir distribution from a Python 3.13 environment:
 
 ```powershell
 py -3.13 -m PyInstaller nimbus.spec --noconfirm
 ```
 
-The executable is written to `dist\Nimbus\Nimbus.exe`. Before launching it normally, verify the frozen bundle has every runtime import and native DLL without opening a tray window, microphone, or network connection:
+The executable is produced at `dist\Nimbus\Nimbus.exe`. Verify its imports without opening a GUI, microphone, or network connection:
 
 ```powershell
 dist\Nimbus\Nimbus.exe --selftest
-# SELFTEST OK
 ```
 
-To make the optional installer after a successful PyInstaller build, install Inno Setup 6+ and run:
+Build the installer with Inno Setup 6+:
 
 ```powershell
 iscc installer\nimbus.iss
 ```
 
-This produces `installer\Output\Nimbus-Windows-Setup-v1.0.0.exe`. Inno Setup is not a Python dependency; if `iscc` is unavailable, install it separately or skip this optional installer step.
+The release workflow runs tests in a clean environment, assigns an automated `1.0.<GitHub run number>` version, builds the frozen app, runs its `--selftest`, builds the Inno Setup installer, and creates or updates the corresponding GitHub Release. Nimbus also checks the latest release asynchronously at startup and offers to open it when a newer version is available.
 
-Every push to `main` also runs the release workflow. After tests pass, GitHub Actions builds the installer, publishes a new GitHub Release, and marks it as the latest download. The release version is automatically `1.0.<GitHub run number>`.
+## Testing
 
-### Providers
+Run the complete suite with `.env` loading disabled so local credentials cannot affect the result:
 
-Nimbus is OpenAI-first but supports swapping any stage from the Settings dialog:
-
-- **LLM (vision + reasoning):** OpenAI (default). Ollama is available for a fully local option.
-- **Speech-to-text:** local faster-whisper (default in the sample config, no key) or AssemblyAI (cloud, faster).
-- **Text-to-speech:** local Kokoro (default in the sample config, no key), or Cartesia / ElevenLabs (cloud).
-
-Pick the local options for STT and TTS and the only key you need is your OpenAI key. Go fully local (Ollama + faster-whisper + Kokoro) and you need no keys at all.
-
-## How it works
-
-The hotkey listener observes `Ctrl+Alt+Space` without consuming the keys, so your typing keeps working. On release, four things kick off in parallel: speech-to-text finalizes, the screen gets captured, per-app memory gets recalled, and a knowledge-base file gets looked up if one exists. The vision model receives the screenshot plus the transcript plus the memory plus the knowledge base, and streams a response. Sentences flush to the text-to-speech provider as soon as a `.!?` boundary is hit, so you start hearing audio while the model is still generating. A `[POINT:x,y:label]` tag in the response drives a per-monitor overlay to point at the exact pixel.
-
-```
-User holds Ctrl+Alt+Space
-        │
-        ├── speech-to-text finalizes         ┐
-        ├── screen capture (overlay hidden)   │  all four run in parallel
-        ├── per-app memory recall             │
-        └── knowledge-base lookup             ┘
-                    │
-                    ▼
-        OpenAI vision model (streaming)
-        ┌───────────┴───────────┐
-        ▼                       ▼
-  sentence-level TTS      [POINT:x,y] → blue cursor overlay
-        │
-        ▼
-   audio playback + memory record
+```powershell
+python -c "import dotenv,pytest,sys; dotenv.load_dotenv=lambda *a,**k:False; sys.exit(pytest.main(['-q']))"
 ```
 
-## Engineering highlights
+The suite currently has **470+ tests** (477 passing in the latest local verification). GitHub Actions runs it on Windows with Python 3.13 for every push and pull request, with `NIMBUS_DISABLE_DOTENV=1`.
 
-- **Sub-2s first-audible-word despite sequential APIs.** Parallel kick-off, sentence-level streaming to TTS, and a double-buffered playback path so the user starts hearing sentence one while the model is still generating sentence two.
-- **Win32 layered click-through overlay, per-monitor DPI-aware.** One overlay widget per physical screen sidesteps mixed-DPI rendering bugs. The blue cursor is always-on-top, click-through, never steals focus, and lands on the correct pixel across monitors at different scaling.
-- **A hotkey that does not break your typing.** An observe-only keyboard listener sees the combo without suppressing it system-wide.
-- **Single-instance mutex.** A named Win32 mutex acquired before the app starts prevents duplicate processes and overlapping voice responses.
-- **Multi-provider via progressive-disclosure UX.** A three-category dropdown (LLM / STT / TTS) with a single key field per selected provider.
-- **Markdown memory and a drop-in knowledge folder.** Two plain-text stores, one `.md` file per app, no vector DB.
+For a deterministic import-only runtime check:
 
-## Where things live
+```powershell
+python -m app --selftest
+# SELFTEST OK
+```
 
-- Per-app memory: `~/.nimbus/memory/<app>.exe.md`
-- Debug logs (attach these when reporting a bug): `~/.nimbus/debug/`
-- Knowledge base: `~/Documents/Nimbus Wiki/<app>.exe.md`
-- API keys: `.env` in the repo, mirrored to Windows Credential Manager
+## Built with OpenAI Codex (powered by GPT-5.6)
 
-## Privacy
+Nimbus was built with **OpenAI Codex, powered by GPT-5.6**. GPT-5.6 powered the development process through Codex; it is not the runtime model used by the app.
 
-Nothing leaves your machine, except the things you explicitly send to your own APIs.
+Codex running on GPT-5.6 accelerated concrete engineering work across the repository:
 
-- API keys live in Windows Credential Manager via DPAPI per-user encryption.
-- Screenshots, voice, transcripts, and model responses go directly from your machine to whichever providers you pick, using YOUR keys, with no proxy in between. Pick the local providers (Ollama, faster-whisper, Kokoro) and that data never leaves your machine at all.
-- Per-app memory and the knowledge-base folder live on your local disk in plain markdown. You can read them, edit them, delete them.
+- Implemented multi-file features from natural-language requests: session-history export, configurable hotkeys, diagnostics/privacy controls, automated releases and the in-app update system, push-to-talk pause, error toasts, audio cues, onboarding, and overlay visual polish.
+- Diagnosed and fixed bugs directly from stack traces: the Qt/Win32 DPI startup conflict, the Knowledge Folder creation crash, the hotkey-validator conflict, and the debug-logging crash path.
+- Authored unit tests and iterated the full suite to a green **470+** tests.
+- Set up GitHub Actions CI and the Windows release pipeline.
+- Refactored the hotkey parser from a fixed combination toward arbitrary supported key chords.
+- Supported codebase Q&A and architecture decisions, including keeping direct model grounding as the preferred route with verification for small targets, offering OpenAI by default with local STT/TTS privacy options, and using a per-monitor overlay for mixed-DPI correctness.
+
+Those are development-time contributions made with Codex/GPT-5.6. They are separate from Nimbus's runtime model calls described below.
+
+## The app's runtime AI (separate from Codex)
+
+At runtime, Nimbus uses an OpenAI vision model configured by `OPENAI_MODEL_VISION` for screen understanding, pixel-accurate `[POINT:x,y]` UI grounding, the verification/refinement pass for small targets, Tutor mode annotation geometry (`[CIRCLE]`, `[ARROW]`, `[UNDERLINE]`, `[LABEL]`), and natural spoken-answer generation through the selected LLM path.
+
+This runtime AI is independent of the **GPT-5.6 model that powered development through Codex**. Nimbus can also use local faster-whisper for STT and Kokoro for TTS, and supports an Ollama LLM option for a local model path.
+
+## Submission info
+
+- Demo video: [TODO: YouTube URL]
+- Codex /feedback session ID: [TODO: session ID]
+- Code repository: https://github.com/EmadQureshiKhi/Nimbus
 
 ## License
 
-[MIT](LICENSE).
+[MIT (The Nimbus Authors)](LICENSE).
