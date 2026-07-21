@@ -241,6 +241,21 @@ class TestSetDpiAwareness:
         # Second call must not raise:
         set_dpi_awareness()
 
+    def test_qt_owns_dpi_awareness_after_application_starts(self, mocker):
+        """Never call the legacy shcore API after Qt selected PMv2.
+
+        This prevents Qt's ``SetProcessDpiAwarenessContext() failed: Access
+        is denied`` startup warning: QApplication must be the sole owner of
+        Nimbus's process DPI mode.
+        """
+        from capture import set_dpi_awareness
+
+        mocker.patch("capture.QCoreApplication.instance", return_value=object())
+        set_awareness = mocker.patch("capture.ctypes.windll.shcore.SetProcessDpiAwareness")
+
+        assert set_dpi_awareness() is False
+        set_awareness.assert_not_called()
+
 
 # --- capture_all_screens ------------------------------------------------------
 

@@ -45,7 +45,6 @@ from capture import (
     get_cursor_position,
     list_monitors,
     monitor_containing,
-    set_dpi_awareness,
     unscale_model_coords,
 )
 from config import (
@@ -369,6 +368,9 @@ class NimbusApp(QObject):
     # exports through a signal so MemoryStore reads and the file write always
     # happen in this QObject's main-thread slot.
     sig_export_session_history = pyqtSignal()
+    # Update checks run off the UI thread; only this signal is allowed to show
+    # the user-facing dialog on Qt's main thread.
+    sig_update_available = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -444,6 +446,7 @@ class NimbusApp(QObject):
         self.sig_show_annotations.connect(self._on_show_annotations)
         self.sig_clear_annotations.connect(self._on_clear_annotations)
         self.sig_export_session_history.connect(self._on_export_session_history)
+        self.sig_update_available.connect(self._on_update_available)
 
     def start(self) -> None:
         """Initialize overlay + hotkey and begin listening.
@@ -1385,6 +1388,39 @@ class NimbusApp(QObject):
         except Exception as exc:
             _log(f"ERROR: Session-history export failed — {type(exc).__name__}: {exc}")
 
+    # --- Release update check -------------------------------------------------
+
+    def check_for_updates_async(self) -> None:
+        """Check GitHub Releases without delaying tray or microphone startup."""
+        if os.getenv("NIMBUS_DISABLE_UPDATES") == "1":
+            return
+
+        def worker() -> None:
+            from updates import check_for_update
+
+            update = check_for_update()
+            if update is not None:
+                self.sig_update_available.emit(update.version, update.url)
+
+        threading.Thread(
+            target=worker, daemon=True, name="nimbus-update-check"
+        ).start()
+
+    def _on_update_available(self, version: str, url: str) -> None:
+        """Offer the latest release from the Qt main thread."""
+        from PyQt6.QtWidgets import QMessageBox
+        import webbrowser
+
+        reply = QMessageBox.information(
+            None,
+            "Nimbus update available",
+            f"Nimbus {version} is available. Download and install it now?",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Open,
+        )
+        if reply == QMessageBox.StandardButton.Open:
+            webbrowser.open(url)
+
 
 _T0 = __import__("time").time()
 
@@ -1655,9 +1691,43 @@ def _should_connect_stt(realtime) -> bool:
     return realtime is None
 
 
+def _run_selftest() -> None:
+    """Import every runtime module without starting Qt, audio, or network I/O.
+
+    Used by the frozen build check: a successful run proves PyInstaller
+    included Nimbus's Python modules, native extensions, and their dependent
+    DLLs without requiring a tray, microphone, API key, or display session.
+    """
+    import importlib
+
+    # The distributed app is a windowed (console=False) executable so normal
+    # tray launches never flash a console. For this explicit CLI-only check,
+    # attach to the invoking PowerShell/cmd console and recreate stdout so
+    # `Nimbus.exe --selftest` visibly reports its result.
+    if getattr(sys, "frozen", False):
+        try:
+            ctypes.windll.kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        except OSError:
+            pass
+
+    runtime_modules = (
+        "ai", "stt", "tts", "overlay", "memory", "kb", "capture",
+        "hotkey", "realtime", "settings_dialog", "tray", "config",
+        "updates", "version",
+    )
+    for module_name in runtime_modules:
+        importlib.import_module(module_name)
+    print("SELFTEST OK", flush=True)
+
+
 # --- Manual entry point -------------------------------------------------------
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _run_selftest()
+        sys.exit(0)
+
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
@@ -1688,7 +1758,9 @@ if __name__ == "__main__":
     print("Nimbus — push-to-talk AI buddy")
     print("=" * 70)
 
-    set_dpi_awareness()
+    # Qt must own process DPI awareness. QApplication sets Windows'
+    # Per-Monitor-V2 context during construction; setting the legacy shcore
+    # DPI mode first makes Qt log E_ACCESSDENIED and prevents V2.
     qt_app = QApplication(sys.argv)
     # App-level icon — used by Qt for any window that doesn't set its
     # own (overlay, future dialogs). Belt-and-suspenders alongside
@@ -1829,6 +1901,7 @@ if __name__ == "__main__":
         _log("REALTIME: skipping AssemblyAI STT mic (GPT-Realtime owns the mic)")
 
     nimbus.start()
+    nimbus.check_for_updates_async()
 
     # System tray icon — the ONLY clean exit path now that the overlay
     # has WS_EX_TOOLWINDOW (no taskbar entry) and there's no console

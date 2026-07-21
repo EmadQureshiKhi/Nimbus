@@ -33,14 +33,20 @@ from dataclasses import dataclass
 
 import mss
 from PIL import Image, ImageDraw
+from PyQt6.QtCore import QCoreApplication
 
 from config import CANDIDATE_RESOLUTIONS
 
 
 # --- Win32 constants ---------------------------------------------------------
 
-_PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
-"""SetProcessDpiAwareness value for per-monitor v2 (Win10 1703+)."""
+_PROCESS_PER_MONITOR_DPI_AWARE = 2
+"""Legacy ``SetProcessDpiAwareness`` value for per-monitor awareness.
+
+This API does not support Per-Monitor-V2. Qt configures the newer V2 context
+when QApplication starts, so this is only a fallback for standalone capture
+usage before Qt exists.
+"""
 
 
 class _POINT(ctypes.Structure):
@@ -210,19 +216,23 @@ def unscale_model_coords(
 # --- OS wrappers -------------------------------------------------------------
 
 def set_dpi_awareness() -> bool:
-    """Set per-monitor v2 DPI awareness for this process.
+    """Set legacy per-monitor DPI awareness only before Qt starts.
 
-    Windows only allows DPI awareness to be set once per process. If another
-    library (PyQt6, tkinter, a previous call from us) already set it, the
-    call returns E_ACCESSDENIED (-2147024891) and this function returns
-    False without raising. Either way, per-monitor v2 is active.
+    Qt owns process DPI configuration for Nimbus. When a Qt application is
+    live, it has already selected Per-Monitor-V2 before any overlay or capture
+    work begins; calling the legacy shcore API afterwards would only return
+    E_ACCESSDENIED. For standalone ``capture.py`` use before Qt starts, retain
+    the legacy per-monitor fallback.
 
     Returns:
-        True if we set it successfully just now, False if it was already set.
+        True if the standalone fallback set it, False when Qt already owns DPI
+        awareness or Windows rejects a duplicate call.
     """
+    if QCoreApplication.instance() is not None:
+        return False
     try:
         hresult = ctypes.windll.shcore.SetProcessDpiAwareness(
-            _PROCESS_PER_MONITOR_DPI_AWARE_V2
+            _PROCESS_PER_MONITOR_DPI_AWARE
         )
         return hresult == 0
     except OSError:
