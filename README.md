@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/nimbus%20logo%201.png" alt="Nimbus logo" width="260" />
+  <img src="assets/nimbus%20logo%201.png" alt="Nimbus logo" width="420" />
 </p>
 
 # Nimbus
