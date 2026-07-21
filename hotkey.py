@@ -137,6 +137,8 @@ def parse_hotkey(value: str) -> HotkeyCombo:
         raise ValueError("Alt+Space opens the Windows window menu; add Ctrl or choose another key.")
     if modifiers == frozenset({"ctrl", "shift"}) and trigger == "space":
         raise ValueError("Ctrl+Shift+Space conflicts with Excel and Google Sheets; choose another chord.")
+    if modifiers == frozenset({"ctrl"}) and trigger == "space":
+        raise ValueError("Ctrl+Space conflicts with VS Code IntelliSense; add Alt or choose another key.")
     return HotkeyCombo(modifiers, trigger)
 
 
@@ -198,6 +200,7 @@ class PushToTalkHotkey:
         self._down_modifiers: set[str] = set()
         self._trigger_down: bool = False
         self._state: HotkeyState = HotkeyState.IDLE
+        self._enabled: bool = True
 
         self._listener = None  # set in start(), cleared in stop()
 
@@ -206,6 +209,33 @@ class PushToTalkHotkey:
         """Current state machine position. Thread-safe read."""
         with self._lock:
             return self._state
+
+    @property
+    def enabled(self) -> bool:
+        """Whether PTT callbacks are currently accepted (listener remains installed)."""
+        with self._lock:
+            return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Pause/resume PTT without tearing down the global keyboard hook.
+
+        Pausing during a recording cleanly ends that recording once, then
+        ignores all later key events until resumed.
+        """
+        fire_release = False
+        with self._lock:
+            enabled = bool(enabled)
+            if self._enabled == enabled:
+                return
+            self._enabled = enabled
+            if not enabled and self._state == HotkeyState.RECORDING:
+                fire_release = True
+            self._state = HotkeyState.IDLE
+            self._down_modifiers.clear()
+            self._trigger_down = False
+            self._sync_legacy_flags()
+        if fire_release:
+            self._on_release_cb()
 
     # --- public lifecycle ----------------------------------------------------
 
@@ -322,6 +352,8 @@ class PushToTalkHotkey:
         """
         fire_press = False
         with self._lock:
+            if not self._enabled:
+                return None
             modifier = self._modifier_for_key(key)
             if modifier is not None:
                 self._down_modifiers.add(modifier)
@@ -352,6 +384,8 @@ class PushToTalkHotkey:
         """
         fire_release = False
         with self._lock:
+            if not self._enabled:
+                return None
             modifier = self._modifier_for_key(key)
             is_hotkey_key = (
                 (modifier is not None and modifier in self._combo.modifiers)

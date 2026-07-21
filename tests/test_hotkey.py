@@ -35,7 +35,7 @@ class TestParseHotkey:
         from hotkey import parse_hotkey
         assert parse_hotkey("Control + Shift + F2").display == "ctrl+shift+f2"
 
-    @pytest.mark.parametrize("value", ["space", "ctrl+alt", "ctrl+ctrl+space", "ctrl+alt+escape", "alt+space", "ctrl+shift+space"])
+    @pytest.mark.parametrize("value", ["space", "ctrl+alt", "ctrl+ctrl+space", "ctrl+alt+escape", "alt+space", "ctrl+shift+space", "ctrl+space"])
     def test_rejects_unsafe_or_invalid_combo(self, value):
         from hotkey import parse_hotkey
         with pytest.raises(ValueError):
@@ -44,6 +44,23 @@ class TestParseHotkey:
 
 def test_hotkey_module_importable():
     import hotkey  # noqa: F401
+
+
+def test_pause_prevents_press_and_resumes():
+    """Pause keeps the listener alive but blocks PTT callbacks until resumed."""
+    from hotkey import PushToTalkHotkey
+    pressed = MagicMock()
+    hotkey = PushToTalkHotkey(pressed, MagicMock(), listener_class=MagicMock())
+    hotkey.set_enabled(False)
+    hotkey._handle_press(keyboard.Key.ctrl)
+    hotkey._handle_press(keyboard.Key.alt)
+    hotkey._handle_press(keyboard.Key.space)
+    pressed.assert_not_called()
+    hotkey.set_enabled(True)
+    hotkey._handle_press(keyboard.Key.ctrl)
+    hotkey._handle_press(keyboard.Key.alt)
+    hotkey._handle_press(keyboard.Key.space)
+    pressed.assert_called_once()
 
 
 class TestStateMachine:
