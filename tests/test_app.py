@@ -917,6 +917,49 @@ class TestLooksDirectional:
         assert _looks_directional("Click The Button") is True
 
 
+class TestGroundingRefinement:
+    def _capture(self):
+        from PIL import Image
+        cap = type("Capture", (), {})()
+        cap.image = Image.new("RGB", (1000, 500), "white")
+        cap.source_image = Image.new("RGB", (2000, 1000), "white")
+        cap.target_width, cap.target_height = 1000, 500
+        cap.monitor = {"left": 100, "top": 50, "width": 2000, "height": 1000}
+        cap.cursor_physical = (1100, 550)
+        return cap
+
+    def test_cursor_reference_uses_captured_mouse_as_refinement_seed(self, mocker):
+        from app import _refine_model_coordinate
+        cap = self._capture()
+        refine = mocker.patch("app.refine_point_via_crop", return_value=(1200, 600))
+        result = _refine_model_coordinate(
+            ai_client=mocker.MagicMock(), capture=cap, model_x=100, model_y=100,
+            target="button", query="what is this near my cursor?",
+        )
+        assert result == (600, 300)
+        assert refine.call_args.kwargs["seed_x"] == 1000
+        assert refine.call_args.kwargs["seed_y"] == 500
+
+    def test_failed_refinement_keeps_primary_result(self, mocker):
+        from app import _refine_model_coordinate
+        mocker.patch("app.refine_point_via_crop", return_value=None)
+        assert _refine_model_coordinate(
+            ai_client=mocker.MagicMock(), capture=self._capture(), model_x=100,
+            model_y=100, target="button", query="where is the button",
+        ) is None
+
+    def test_tutor_circle_and_arrow_head_are_refined(self, mocker):
+        from app import _refine_annotations
+        from annotations import Arrow, Circle
+        cap = self._capture()
+        refine = mocker.patch("app._refine_model_coordinate", side_effect=[(11, 12), (21, 22)])
+        annotations = [Circle(1, 2, 8, "save"), Arrow(3, 4, 5, 6)]
+        assert _refine_annotations(mocker.MagicMock(), annotations, cap, "where is save") == [
+            Circle(11, 12, 8, "save"), Arrow(3, 4, 21, 22),
+        ]
+        assert refine.call_count == 2
+
+
 class TestMaybeLocateViaGrid:
     """Tests for app._maybe_locate_via_grid — only fires for Ollama + directional + no coord."""
 

@@ -28,6 +28,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QStandardPaths, pyqtSignal
 from PyQt6.QtWidgets import QApplication
+from PIL import Image
 
 import kb
 from ai import (
@@ -39,7 +40,7 @@ from ai import (
 )
 from annotations import parse_annotations
 from debug_log import DebugSession
-from locator import locate_via_grid
+from locator import locate_via_grid, refine_point_via_crop
 from capture import (
     capture_all_screens,
     get_cursor_position,
@@ -54,6 +55,7 @@ from config import (
     CARTESIA_API_KEY,
     GEMINI_API_KEY,
     GEMINI_MODEL_VISION,
+    HOTKEY,
     MODEL_ID,
     OLLAMA_HOST,
     OLLAMA_MODEL_VISION,
@@ -164,6 +166,99 @@ def _looks_directional(query: str) -> bool:
         return False
     q_lower = query.lower()
     return any(word in q_lower for word in _DIRECTIONAL_QUERY_WORDS)
+
+
+_CURSOR_REFERENCE_WORDS = (
+    "cursor", "mouse", "pointer", "this", "here", "right here", "this one",
+)
+"""Words that make the captured mouse position useful as a refinement seed."""
+
+
+def _references_cursor_area(query: str) -> bool:
+    """Whether the user is likely referring to the area around their mouse."""
+    return bool(query) and any(word in query.lower() for word in _CURSOR_REFERENCE_WORDS)
+
+
+def _refine_model_coordinate(
+    *, ai_client, capture, model_x: int, model_y: int, target: str,
+    query: str, dbg=None,
+) -> tuple[int, int] | None:
+    """Run a high-detail crop verification and return model-space coordinates.
+
+    The first vision pass retains the full-screen context. This second pass is
+    deliberately narrow and native-resolution, so it is used only after a
+    directional direct point (or when the user explicitly refers to the mouse
+    area). Failure is non-destructive: callers keep the first point.
+    """
+    source = getattr(capture, "source_image", None)
+    if not isinstance(source, Image.Image):
+        source = getattr(capture, "image", None)
+    if not isinstance(source, Image.Image):
+        return None
+
+    target_w, target_h = capture.target_width, capture.target_height
+    seed_x = round(model_x * source.width / target_w)
+    seed_y = round(model_y * source.height / target_h)
+    if _references_cursor_area(query):
+        cursor = getattr(capture, "cursor_physical", None)
+        monitor = capture.monitor
+        if cursor is not None:
+            cursor_x = cursor[0] - monitor["left"]
+            cursor_y = cursor[1] - monitor["top"]
+            if 0 <= cursor_x < source.width and 0 <= cursor_y < source.height:
+                seed_x, seed_y = cursor_x, cursor_y
+                if dbg is not None:
+                    dbg.log("GROUNDING: using captured mouse area as verification seed")
+
+    refined = refine_point_via_crop(
+        llm_client=ai_client,
+        source_image=source,
+        seed_x=seed_x,
+        seed_y=seed_y,
+        target=target or query,
+        debug_log=(dbg.log if dbg is not None else None),
+    )
+    if refined is None:
+        return None
+    refined_x = max(0, min(target_w - 1, round(refined[0] * target_w / source.width)))
+    refined_y = max(0, min(target_h - 1, round(refined[1] * target_h / source.height)))
+    return refined_x, refined_y
+
+
+def _refine_annotations(ai_client, annotations: list, capture, query: str, dbg=None) -> list:
+    """Refine up to two Tutor-mode circle/arrow anchors in detail crops.
+
+    A Tutor response already supplies the useful teaching geometry (circle
+    radius and arrow start). The verifier replaces only its target anchor:
+    circle centre or arrow head. That keeps the explanation's intent while
+    making small controls materially easier to hit.
+    """
+    from annotations import Arrow, Circle
+
+    refined_count = 0
+    output: list = []
+    for annotation in annotations:
+        if refined_count >= 2 or not isinstance(annotation, (Circle, Arrow)):
+            output.append(annotation)
+            continue
+        if isinstance(annotation, Circle):
+            candidate = _refine_model_coordinate(
+                ai_client=ai_client, capture=capture, model_x=annotation.x,
+                model_y=annotation.y, target=annotation.label, query=query, dbg=dbg,
+            )
+            if candidate is not None:
+                annotation = Circle(candidate[0], candidate[1], annotation.r, annotation.label)
+                refined_count += 1
+        else:
+            candidate = _refine_model_coordinate(
+                ai_client=ai_client, capture=capture, model_x=annotation.x2,
+                model_y=annotation.y2, target=query, query=query, dbg=dbg,
+            )
+            if candidate is not None:
+                annotation = Arrow(annotation.x1, annotation.y1, candidate[0], candidate[1])
+                refined_count += 1
+        output.append(annotation)
+    return output
 
 
 def _annotations_to_physical(annotations: list, cursor_capture) -> list:
@@ -461,6 +556,7 @@ class NimbusApp(QObject):
             self._hotkey = PushToTalkHotkey(
                 on_press=lambda: self.sig_pressed.emit(),
                 on_release=lambda: self.sig_released.emit(),
+                hotkey=HOTKEY,
             )
         # Wire RMS audio-level → Qt-thread-safe signal → overlay waveform.
         # stt's callback runs on the portaudio thread; pyqtSignal marshals
@@ -468,7 +564,7 @@ class NimbusApp(QObject):
         self._stt.on_audio_level(lambda lvl: self.sig_audio_level.emit(lvl))
 
         self._hotkey.start()
-        _log("Listening for Ctrl+Alt+Space...")
+        _log(f"Listening for {HOTKEY}...")
 
     def stop(self) -> None:
         """Clean shutdown of all services."""
@@ -564,6 +660,7 @@ class NimbusApp(QObject):
                 pass
             result = stream.final_result()
         _, anns = parse_annotations(result.spoken_text)
+        anns = _refine_annotations(vision_client, anns, cap, query)
         return _annotations_to_physical(anns, cap)
 
     def _realtime_locate_point(self, label, cap, vision_client):
@@ -580,6 +677,16 @@ class NimbusApp(QObject):
         if not points:
             return None
         p = points[0]
+        refined = _refine_model_coordinate(
+            ai_client=vision_client,
+            capture=cap,
+            model_x=p["x"],
+            model_y=p["y"],
+            target=p.get("label", label),
+            query=query,
+        )
+        if refined is not None:
+            p = {**p, "x": refined[0], "y": refined[1]}
         return unscale_model_coords(
             model_x=p["x"],
             model_y=p["y"],
@@ -1073,6 +1180,9 @@ class NimbusApp(QObject):
                 spoken_text, _anns = parse_annotations(result.spoken_text)
                 if _anns:
                     try:
+                        _anns = _refine_annotations(
+                            self._ai, _anns, cursor_capture, transcript, dbg
+                        )
                         phys_annotations = _annotations_to_physical(
                             _anns, cursor_capture
                         )
@@ -1136,6 +1246,7 @@ class NimbusApp(QObject):
             if cancel.is_set():
                 return
 
+            resolved_coordinate = result.coordinate
             if result.coordinate:
                 x_model, y_model = result.coordinate
                 screen_num = result.screen_number
@@ -1153,6 +1264,25 @@ class NimbusApp(QObject):
                         if f"screen{screen_num}" in c.label.replace(" ", ""):
                             target_capture = c
                             break
+
+                # Direct GPT-5.4 grounding remains the primary result. For a
+                # directional target, verify it in a compact native-resolution
+                # crop before placing the cursor. A failed/uncertain verifier
+                # never replaces the original coordinate.
+                if _looks_directional(transcript) or _references_cursor_area(transcript):
+                    refined = _refine_model_coordinate(
+                        ai_client=self._ai,
+                        capture=target_capture,
+                        model_x=x_model,
+                        model_y=y_model,
+                        target=result.element_label or transcript,
+                        query=transcript,
+                        dbg=dbg,
+                    )
+                    if refined is not None:
+                        x_model, y_model = refined
+                        resolved_coordinate = refined
+                        dbg.log(f"COORDS: verified model=({x_model},{y_model})")
 
                 phys_x, phys_y = unscale_model_coords(
                     model_x=x_model,
@@ -1201,8 +1331,8 @@ class NimbusApp(QObject):
                 )
 
             pointer_targets = []
-            if result.coordinate:
-                pointer_targets.append(result.coordinate)
+            if resolved_coordinate:
+                pointer_targets.append(resolved_coordinate)
             elif locator_phys_xy is not None:
                 # Memory recording: store the grid-locator coords (physical
                 # virtual-desktop space) so future recall can reference them

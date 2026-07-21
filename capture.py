@@ -95,7 +95,10 @@ class LabeledCapture:
         target_width: width declared to Nimbus's vision call.
         target_height: height declared to Nimbus's vision call.
         scale_x: physical monitor width / target_width (for unscaling).
-        scale_y: physical monitor height / target_height (for unscaling).
+    scale_y: physical monitor height / target_height (for unscaling).
+        source_image: original monitor capture in physical pixels.  It is not
+            sent during the first vision pass; it is retained for a compact
+            high-detail grounding verification crop.
     """
     image: Image.Image
     label: str
@@ -105,6 +108,8 @@ class LabeledCapture:
     target_height: int
     scale_x: float
     scale_y: float
+    source_image: Image.Image | None = None
+    cursor_physical: tuple[int, int] | None = None
 
 
 # --- Pure functions ----------------------------------------------------------
@@ -136,6 +141,10 @@ def pick_resolution(width: int, height: int) -> tuple[int, int]:
         CANDIDATE_RESOLUTIONS,
         key=lambda res: abs(source_ratio - (res[0] / res[1])),
     )
+    # Never manufacture pixels by upscaling a small display. It makes text
+    # softer while providing no additional visual evidence to the model.
+    if width <= best[0] and height <= best[1]:
+        return width, height
     return best
 
 
@@ -371,6 +380,8 @@ def capture_all_screens() -> list[LabeledCapture]:
             target_height=target_h,
             scale_x=scale_x,
             scale_y=scale_y,
+            source_image=raw_img,
+            cursor_physical=(cursor_x, cursor_y),
         ))
 
     results.sort(key=lambda c: (not c.is_cursor_screen,))

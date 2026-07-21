@@ -13,6 +13,34 @@ Tests cover:
 
 from __future__ import annotations
 
+
+class TestRefinementCrop:
+    def test_crop_keeps_native_pixels_and_stays_in_bounds(self):
+        from PIL import Image
+        from locator import crop_for_refinement
+        image = Image.new("RGB", (2000, 1200), "white")
+        crop, left, top = crop_for_refinement(image, 1990, 1190, crop_size=900)
+        assert crop.size == (900, 900)
+        assert (left, top) == (1100, 300)
+
+    def test_refinement_maps_crop_point_back_to_source(self, mocker):
+        from PIL import Image
+        from locator import refine_point_via_crop
+
+        class Stream:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def text_deltas(self): return iter(())
+            def final_result(self):
+                return type("Result", (), {"coordinate": (450, 451)})()
+
+        client = mocker.MagicMock()
+        client.ask_stream.return_value = Stream()
+        assert refine_point_via_crop(
+            llm_client=client, source_image=Image.new("RGB", (2000, 1200)),
+            seed_x=1000, seed_y=600, target="save",
+        ) == (1000, 601)
+
 import base64
 import io
 import pytest

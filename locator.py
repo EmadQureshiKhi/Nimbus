@@ -59,6 +59,16 @@ STAGE2_COLS = 6
 STAGE2_ROWS = 6
 ZOOM_RADIUS_CELLS = 1   # Stage-2 zoom region = (1 + 2*ZOOM_RADIUS) cells wide
 MAX_INFERENCE_WIDTH = 1280
+REFINEMENT_CROP_SIZE = 900
+"""Physical-pixel side length of the high-detail verification crop."""
+
+_REFINEMENT_SYSTEM_PROMPT = """\
+You are Nimbus's visual grounding verifier. You receive one tightly cropped
+screen image. Identify the exact center of the requested UI element in this
+crop, not a nearby label or a broad region. The crop dimensions in the image
+label are the coordinate space. Reply with ONLY [POINT:x,y:target] or
+[POINT:none] if the target is not visible.\
+"""
 
 
 # --- Grid drawing -------------------------------------------------------------
@@ -131,6 +141,79 @@ def _img_to_jpeg_b64(img: Image.Image, quality: int = 85) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def crop_for_refinement(
+    image: Image.Image,
+    center_x: int,
+    center_y: int,
+    crop_size: int = REFINEMENT_CROP_SIZE,
+) -> tuple[Image.Image, int, int]:
+    """Return a bounded high-detail crop and its top-left source coordinates.
+
+    Keeping the crop at the source image's native pixels is intentional: tiny
+    icons and text are the cases where a full-screen resize loses the detail
+    needed for reliable grounding.
+    """
+    if crop_size <= 0:
+        raise ValueError("crop_size must be positive")
+    width, height = image.size
+    crop_w, crop_h = min(crop_size, width), min(crop_size, height)
+    left = max(0, min(center_x - crop_w // 2, width - crop_w))
+    top = max(0, min(center_y - crop_h // 2, height - crop_h))
+    return image.crop((left, top, left + crop_w, top + crop_h)), left, top
+
+
+def refine_point_via_crop(
+    *,
+    llm_client,
+    source_image: Image.Image,
+    seed_x: int,
+    seed_y: int,
+    target: str,
+    debug_log: Optional[callable] = None,
+) -> Optional[tuple[int, int]]:
+    """Verify a likely target in a native-resolution crop.
+
+    The return value is in ``source_image`` coordinates, not crop coordinates.
+    A failed verification deliberately returns ``None`` so the caller retains
+    the original direct-model point instead of making an uncertain correction.
+    """
+    try:
+        crop, left, top = crop_for_refinement(source_image, seed_x, seed_y)
+        label = (
+            f"high-detail verification crop (image dimensions: "
+            f"{crop.width}x{crop.height} pixels)"
+        )
+        prompt = (
+            f"Find the exact center of: {target}. The crop is centred near "
+            f"the likely location; verify it rather than guessing."
+        )
+        with llm_client.ask_stream(
+            images=[(crop, label)], transcript=prompt, history=[],
+            system_prompt=_REFINEMENT_SYSTEM_PROMPT,
+        ) as stream:
+            for _ in stream.text_deltas():
+                pass
+            result = stream.final_result()
+        point = getattr(result, "coordinate", None)
+        if point is None:
+            if debug_log is not None:
+                debug_log("GROUNDING: verification returned no point; keeping direct result")
+            return None
+        x, y = point
+        if not (0 <= x < crop.width and 0 <= y < crop.height):
+            if debug_log is not None:
+                debug_log("GROUNDING: verification point out of crop bounds; keeping direct result")
+            return None
+        refined = (left + x, top + y)
+        if debug_log is not None:
+            debug_log(f"GROUNDING: crop verification refined to source={refined}")
+        return refined
+    except Exception as exc:
+        if debug_log is not None:
+            debug_log(f"GROUNDING: crop verification failed ({type(exc).__name__}: {exc})")
+        return None
 
 
 # --- Cell-number parsing ------------------------------------------------------

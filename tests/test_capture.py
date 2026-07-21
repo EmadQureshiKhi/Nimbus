@@ -22,14 +22,14 @@ class TestPickResolution:
     """
 
     def test_16_10_exact_match(self):
-        """2880x1800 (16:10) -> 1280x800. User's MacBook-class display."""
+        """2880x1800 (16:10) keeps high detail at 1920x1200."""
         from capture import pick_resolution
-        assert pick_resolution(2880, 1800) == (1280, 800)
+        assert pick_resolution(2880, 1800) == (1920, 1200)
 
     def test_16_9_laptop(self):
         """1920x1080 (16:9) -> 1366x768. Most generic laptops / externals."""
         from capture import pick_resolution
-        assert pick_resolution(1920, 1080) == (1366, 768)
+        assert pick_resolution(1920, 1080) == (1920, 1080)
 
     def test_4_3_legacy(self):
         """1024x768 (4:3) -> 1024x768. Exact match for legacy displays."""
@@ -39,12 +39,12 @@ class TestPickResolution:
     def test_ultrawide_falls_back_to_closest(self):
         """3440x1440 (21:9 ~= 2.389) -> 1366x768 (1.779). Closest available."""
         from capture import pick_resolution
-        assert pick_resolution(3440, 1440) == (1366, 768)
+        assert pick_resolution(3440, 1440) == (1920, 1080)
 
     def test_square_picks_4_3(self):
         """1000x1000 (1.0) -> 1024x768 (1.333). 4:3 is closest of the three."""
         from capture import pick_resolution
-        assert pick_resolution(1000, 1000) == (1024, 768)
+        assert pick_resolution(1000, 1000) == (1000, 1000)
 
     def test_invalid_dimensions_raise(self):
         """Zero or negative dimensions must raise ValueError."""
@@ -279,7 +279,9 @@ class TestCaptureAllScreens:
         assert isinstance(results[0], LabeledCapture)
         assert results[0].is_cursor_screen is True
         assert "primary focus" in results[0].label
-        assert "1280x800" in results[0].label or "1024x768" in results[0].label or "1366x768" in results[0].label
+        assert "1920x1200" in results[0].label
+        assert results[0].source_image is fake_img
+        assert results[0].cursor_physical == (500, 400)
 
     def test_two_monitors_sorted_cursor_first(self, mocker):
         from PIL import Image
