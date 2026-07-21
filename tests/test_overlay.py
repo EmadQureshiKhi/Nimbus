@@ -388,6 +388,51 @@ class TestBezierFlightMath:
         assert abs(_scale_pulse(1.0) - 1.0) < 1e-6
 
 
+class TestOverlayVisualHelpers:
+    """Pure visual timing, palette, and geometry helpers stay display-free."""
+
+    def test_idle_breath_scale_stays_subtle(self):
+        from overlay import _idle_breath_scale
+        samples = [_idle_breath_scale(t / 20) for t in range(61)]
+        assert min(samples) >= 1.0 - 1e-9
+        assert max(samples) <= 1.05 + 1e-9
+
+    def test_annotation_opacity_fades_in_then_out_before_clear(self):
+        from overlay import _annotation_opacity
+        assert _annotation_opacity(0.0) == 0.0
+        assert 0.0 < _annotation_opacity(0.09) < 1.0
+        assert _annotation_opacity(1.0) == 1.0
+        assert 0.0 < _annotation_opacity(29.8) < 1.0
+        assert _annotation_opacity(30.0) == 0.0
+
+    def test_curved_arrow_control_bends_off_the_straight_line(self):
+        from overlay import _curved_arrow_control
+        x, y = _curved_arrow_control(0, 0, 100, 0)
+        assert x == 50.0
+        assert y > 0.0
+
+    def test_state_accent_mapping_is_centralized_and_semantic(self):
+        from overlay import _OverlayState, _accent_rgb
+        assert _accent_rgb(_OverlayState.LISTENING) == (34, 197, 94)
+        assert _accent_rgb(_OverlayState.THINKING) == (245, 158, 11)
+        assert _accent_rgb(_OverlayState.POINTING) == (59, 130, 246)
+        assert _accent_rgb(_OverlayState.IDLE) == (96, 165, 250)
+
+    def test_spinner_tail_has_bright_head_and_fading_tail(self):
+        from overlay import _spinner_tail_segments
+        tail = _spinner_tail_segments(90.0)
+        assert tail[0][0] == 90.0
+        assert tail[0][1] > tail[-1][1] > 0.0
+
+    def test_waveform_colour_brightens_with_volume(self):
+        from overlay import _waveform_color_rgb
+        base = (34, 197, 94)
+        quiet = _waveform_color_rgb(0.0, base)
+        loud = _waveform_color_rgb(1.0, base)
+        assert all(l >= q for q, l in zip(quiet, loud))
+        assert loud != quiet
+
+
 # --- Waveform widget math -------------------------------------
 
 class TestWaveformBarHeight:

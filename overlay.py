@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import ctypes
 import math
+import time
+from collections import deque
 from itertools import cycle
 
 from enum import Enum, auto
@@ -40,18 +42,46 @@ from enum import Enum, auto
 from PyQt6.QtCore import (
     QPoint,
     QPointF,
+    QRectF,
     QTimer,
     QVariantAnimation,
     Qt,
 )
-from PyQt6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter, QPen, QPolygonF, QScreen
+from PyQt6.QtGui import (
+    QColor, QCursor, QFont, QGuiApplication, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPolygonF, QRadialGradient, QScreen,
+)
 from PyQt6.QtWidgets import QWidget
 
 
 class _OverlayState(Enum):
     IDLE = auto()
     POINTING = auto()
+    LISTENING = auto()
+    THINKING = auto()
     HIDDEN = auto()
+
+
+# The only place the overlay's semantic colours live.  Keeping RGB tuples
+# rather than QColor instances makes this mapping cheap and unit-testable.
+_STATE_ACCENT_RGB: dict[_OverlayState, tuple[int, int, int]] = {
+    _OverlayState.IDLE: (96, 165, 250),       # neutral blue
+    _OverlayState.POINTING: (59, 130, 246),   # Nimbus blue
+    _OverlayState.LISTENING: (34, 197, 94),   # green
+    _OverlayState.THINKING: (245, 158, 11),   # amber
+    _OverlayState.HIDDEN: (96, 165, 250),
+}
+"""Central state -> accent palette used by every overlay visual."""
+
+
+def _accent_rgb(state: _OverlayState) -> tuple[int, int, int]:
+    """Return the theme colour for an overlay interaction state."""
+    return _STATE_ACCENT_RGB.get(state, _STATE_ACCENT_RGB[_OverlayState.IDLE])
+
+
+def _with_alpha(rgb: tuple[int, int, int], alpha: int) -> QColor:
+    """Make a QColor from a test-friendly RGB tuple, clamping alpha."""
+    return QColor(*rgb, max(0, min(int(alpha), 255)))
 
 
 # --- Quadratic bezier flight arc math -------------------------
@@ -88,6 +118,51 @@ def _scale_pulse(linear_t: float) -> float:
     """Sine scale pulse: 1.0 at endpoints → 1.3 at midpoint. Not eased —
     runs on LINEAR progress (not smoothstep'd) so the peak lands dead-center."""
     return 1.0 + math.sin(linear_t * math.pi) * 0.3
+
+
+def _idle_breath_scale(elapsed_s: float) -> float:
+    """A restrained 3-second idle pulse in the inclusive range [1.0, 1.05]."""
+    return 1.025 + math.sin(elapsed_s * math.tau / 3.0) * 0.025
+
+
+def _ease_out_cubic(t: float) -> float:
+    """Clamped easing used for annotation draw-in and fade transitions."""
+    t = max(0.0, min(float(t), 1.0))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def _annotation_opacity(elapsed_s: float, fade_start_s: float = 29.6) -> float:
+    """Fade annotations in quickly, then out gracefully before the 30s clear."""
+    if elapsed_s < 0:
+        return 0.0
+    if elapsed_s < 0.18:
+        return _ease_out_cubic(elapsed_s / 0.18)
+    if elapsed_s >= fade_start_s:
+        return 1.0 - _ease_out_cubic((elapsed_s - fade_start_s) / 0.4)
+    return 1.0
+
+
+def _curved_arrow_control(x1: float, y1: float, x2: float, y2: float) -> tuple[float, float]:
+    """Return a gentle perpendicular control point for an annotation arrow."""
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length < 0.001:
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    bend = min(length * 0.14, 28.0)
+    return ((x1 + x2) / 2.0 - dy / length * bend,
+            (y1 + y2) / 2.0 + dx / length * bend)
+
+
+def _spinner_tail_segments(angle_deg: float, count: int = 12) -> list[tuple[float, float]]:
+    """Comet-tail arc segments as (start angle, opacity fraction), head first."""
+    return [(angle_deg - i * 7.0, (1.0 - i / count) ** 1.7) for i in range(count)]
+
+
+def _waveform_color_rgb(audio_level: float, accent: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Brighten an accent as speech becomes stronger, without changing state hue."""
+    level = max(0.0, min(float(audio_level), 1.0))
+    lift = int(20 + 55 * level)
+    return tuple(min(255, channel + lift) for channel in accent)
 
 
 # --- Waveform widget (LISTENING state visual) -----------------
@@ -414,6 +489,10 @@ class OverlayWindow(QWidget):
         # Pointer state
         self._pointer_pos = QPoint(0, 0)
         self._pointer_visible = False
+        self._visual_state = _OverlayState.IDLE
+        self._visual_started_at = time.monotonic()
+        self._is_flying = False
+        self._recent_pointer_positions: deque[QPointF] = deque(maxlen=9)
 
         # Visual state flags — gates cursor polygon paint + widget positions.
         # Only one of these can be true at a time (a strict state machine —
@@ -434,6 +513,7 @@ class OverlayWindow(QWidget):
         self._flight_p1: tuple[float, float] = (0.0, 0.0)
         self._flight_p2: tuple[float, float] = (0.0, 0.0)
         self._flight_scale: float = 1.0
+        self._flight_anim.finished.connect(self._finish_flight_visual)
 
         # Teaching annotations (arrows/circles/underlines/labels)
         # drawn IN ADDITION to the cursor. Stored in this window's LOCAL-logical
@@ -444,16 +524,35 @@ class OverlayWindow(QWidget):
         self._annotation_clear_timer = QTimer(self)
         self._annotation_clear_timer.setSingleShot(True)
         self._annotation_clear_timer.timeout.connect(self.clear_annotations)
+        self._annotation_started_at: float | None = None
+        self._annotation_repaint_timer = QTimer(self)
+        self._annotation_repaint_timer.setInterval(16)
+        self._annotation_repaint_timer.timeout.connect(self.update)
+
+    def set_visual_state(self, state: _OverlayState) -> None:
+        """Set the semantic accent shared by pointer and child visual widgets."""
+        self._visual_state = state
+        self._visual_started_at = time.monotonic()
+        rgb = _accent_rgb(state)
+        if self._waveform_widget is not None:
+            self._waveform_widget.set_accent(rgb)
+        if self._spinner_widget is not None:
+            self._spinner_widget.set_accent(rgb)
+        self.update()
 
     def set_annotations(self, annotations: list) -> None:
         """Replace the current annotations (LOCAL-logical coords) + repaint.
         Auto-clears after 30s; a new call cancels the prior timer. An empty
         list clears immediately."""
         self._annotations = list(annotations)
+        self._annotation_started_at = time.monotonic() if self._annotations else None
         self.update()
         self._annotation_clear_timer.stop()
         if self._annotations:
             self._annotation_clear_timer.start(30_000)
+            self._annotation_repaint_timer.start()
+        else:
+            self._annotation_repaint_timer.stop()
 
     def clear_annotations(self) -> None:
         # Cheap no-op when already empty so clearing on every press (the stale-
@@ -461,7 +560,9 @@ class OverlayWindow(QWidget):
         if not self._annotations:
             return
         self._annotations = []
+        self._annotation_started_at = None
         self._annotation_clear_timer.stop()
+        self._annotation_repaint_timer.stop()
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -487,29 +588,57 @@ class OverlayWindow(QWidget):
             return
         px, py = self._pointer_pos.x(), self._pointer_pos.y()
 
-        # Glow: semi-transparent blue circle behind the cursor
+        accent = _accent_rgb(self._visual_state)
+        scale = self._flight_scale if self._is_flying else _idle_breath_scale(
+            time.monotonic() - self._visual_started_at
+        )
+
+        # A short, fading flight trail. Positions are tip anchors, so no
+        # coordinate transform is introduced by the cosmetic effect.
+        if self._is_flying and len(self._recent_pointer_positions) > 1:
+            trail = list(self._recent_pointer_positions)[:-1]
+            for index, point in enumerate(trail):
+                fraction = (index + 1) / len(trail)
+                radius = 3.0 + fraction * 6.0
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(_with_alpha(accent, int(12 + fraction * 55)))
+                painter.drawEllipse(point, radius, radius)
+
+        # Soft shadow + diffused state-colour glow.  The actual tip remains at
+        # pointer_pos; only the shadow is offset.
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(30, 144, 255, 35))
-        painter.drawEllipse(QPointF(px + 5, py + 10), 22, 22)
+        painter.setBrush(_with_alpha((0, 0, 0), 55))
+        painter.drawEllipse(QPointF(px + 7, py + 12), 15, 15)
+        painter.setBrush(_with_alpha(accent, 42))
+        painter.drawEllipse(QPointF(px + 5, py + 10), 23, 23)
 
         # Apply mid-flight scale pulse around the tip (0, 0 in cursor space).
         # painter.translate + scale + translate is standard Qt pattern for
         # scaling around a specific point.
-        if self._flight_scale != 1.0:
+        if scale != 1.0:
             painter.save()
             painter.translate(float(px), float(py))
-            painter.scale(self._flight_scale, self._flight_scale)
+            painter.scale(scale, scale)
             painter.translate(-float(px), -float(py))
 
-        # Cursor polygon
-        painter.setBrush(QColor(30, 144, 255, 200))  # dodger blue, more opaque
-        painter.setPen(QPen(QColor(40, 40, 40, 100), 1))
+        # Radial light-to-accent fill gives the vector cursor a little depth.
         poly = QPolygonF([
             QPointF(px + dx, py + dy) for dx, dy in _CURSOR_VERTICES
         ])
+        fill = QRadialGradient(QPointF(px + 4, py + 8), 24)
+        fill.setColorAt(0.0, _with_alpha((225, 244, 255), 245))
+        fill.setColorAt(0.42, _with_alpha(accent, 235))
+        fill.setColorAt(1.0, _with_alpha(tuple(max(0, c - 35) for c in accent), 235))
+        painter.setBrush(fill)
+        painter.setPen(QPen(_with_alpha((255, 255, 255), 190), 1.0))
         painter.drawPolygon(poly)
 
-        if self._flight_scale != 1.0:
+        # Fine dark lower edge makes the shape readable against bright apps.
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(_with_alpha((10, 30, 60), 110), 0.8))
+        painter.drawPolyline(poly)
+
+        if scale != 1.0:
             painter.restore()
 
     def _paint_annotations(self, painter: QPainter) -> None:
@@ -519,33 +648,75 @@ class OverlayWindow(QWidget):
         frame the element without covering it."""
         from annotations import Arrow, Circle, Underline, Label
 
-        accent = QColor(59, 130, 246)  # #3B82F6
-        pen = QPen(accent)
-        pen.setWidth(3)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        elapsed = 0.0 if self._annotation_started_at is None else time.monotonic() - self._annotation_started_at
+        opacity = _annotation_opacity(elapsed)
+        if opacity <= 0.0:
+            return
+        draw_progress = _ease_out_cubic(elapsed / 0.3)
+        accent_rgb = _accent_rgb(_OverlayState.POINTING)
+        accent = _with_alpha(accent_rgb, int(255 * opacity))
         painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
 
         for ann in self._annotations:
             if isinstance(ann, Circle):
-                painter.drawEllipse(QPointF(ann.x, ann.y), float(ann.r), float(ann.r))
+                rect = QRectF(
+                    ann.x - ann.r, ann.y - ann.r, ann.r * 2, ann.r * 2
+                )
+                glow_pen = QPen(_with_alpha(accent_rgb, int(70 * opacity)))
+                glow_pen.setWidth(8)
+                painter.setPen(glow_pen)
+                painter.drawArc(rect, -90 * 16, int(360 * 16 * draw_progress))
+                pen = QPen(accent)
+                pen.setWidth(3)
+                painter.setPen(pen)
+                painter.drawArc(rect, -90 * 16, int(360 * 16 * draw_progress))
                 if ann.label:
-                    painter.drawText(QPointF(ann.x + ann.r + 6, ann.y), ann.label)
+                    self._draw_label_pill(painter, ann.x + ann.r + 8, ann.y, ann.label, accent_rgb, opacity)
             elif isinstance(ann, Arrow):
-                painter.drawLine(
-                    QPointF(ann.x1, ann.y1), QPointF(ann.x2, ann.y2)
-                )
-                self._draw_arrowhead(painter, ann.x1, ann.y1, ann.x2, ann.y2)
+                cx, cy = _curved_arrow_control(ann.x1, ann.y1, ann.x2, ann.y2)
+                path = QPainterPath(QPointF(ann.x1, ann.y1))
+                path.quadTo(QPointF(cx, cy), QPointF(ann.x2, ann.y2))
+                shadow = QPen(_with_alpha((0, 0, 0), int(75 * opacity)))
+                shadow.setWidth(7)
+                shadow.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(shadow)
+                painter.drawPath(path)
+                pen = QPen(accent)
+                pen.setWidth(3)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawPath(path)
+                self._draw_arrowhead(painter, cx, cy, ann.x2, ann.y2, accent_rgb, opacity)
             elif isinstance(ann, Underline):
-                painter.drawLine(
-                    QPointF(ann.x, ann.y), QPointF(ann.x + ann.w, ann.y)
-                )
+                pen = QPen(accent)
+                pen.setWidth(3)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(ann.x, ann.y), QPointF(ann.x + ann.w, ann.y))
             elif isinstance(ann, Label):
-                painter.drawText(QPointF(ann.x, ann.y), ann.text)
+                self._draw_label_pill(painter, ann.x, ann.y, ann.text, accent_rgb, opacity)
+
+    @staticmethod
+    def _draw_label_pill(painter, x: float, y: float, text: str, rgb: tuple[int, int, int], opacity: float) -> None:
+        """Draw a readable rounded label chip at a coordinate without changing it."""
+        metrics = painter.fontMetrics()
+        padding_x, padding_y = 9.0, 5.0
+        width = metrics.horizontalAdvance(text) + padding_x * 2
+        height = metrics.height() + padding_y * 2
+        rect = QRectF(x, y - height / 2, width, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_with_alpha((5, 15, 32), int(185 * opacity)))
+        painter.drawRoundedRect(rect, height / 2, height / 2)
+        painter.setPen(QPen(_with_alpha(rgb, int(170 * opacity)), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, height / 2, height / 2)
+        painter.setPen(_with_alpha((255, 255, 255), int(255 * opacity)))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
     @staticmethod
     def _draw_arrowhead(
-        painter: QPainter, x1: float, y1: float, x2: float, y2: float
+        painter: QPainter, x1: float, y1: float, x2: float, y2: float,
+        rgb: tuple[int, int, int], opacity: float,
     ) -> None:
         """Filled arrowhead at (x2,y2) pointing along the (x1,y1)->(x2,y2) line."""
         import math
@@ -561,7 +732,8 @@ class OverlayWindow(QWidget):
             x2 - size * math.cos(angle + math.pi / 6),
             y2 - size * math.sin(angle + math.pi / 6),
         )
-        painter.setBrush(QColor(59, 130, 246))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_with_alpha(rgb, int(255 * opacity)))
         painter.drawPolygon(QPolygonF([tip, left, right]))
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
@@ -603,6 +775,9 @@ class OverlayWindow(QWidget):
         self._flight_anim.setStartValue(0.0)
         self._flight_anim.setEndValue(1.0)
         self._pointer_visible = True
+        self._is_flying = True
+        self._recent_pointer_positions.clear()
+        self.set_visual_state(_OverlayState.POINTING)
         self._flight_anim.start()
 
     def _on_flight_value(self, linear_t) -> None:
@@ -616,12 +791,19 @@ class OverlayWindow(QWidget):
         eased_t = _smoothstep(t)
         x, y = _bezier_position(eased_t, self._flight_p0, self._flight_p1, self._flight_p2)
         self._pointer_pos = QPoint(int(x), int(y))
+        self._recent_pointer_positions.append(QPointF(float(x), float(y)))
         self._flight_scale = _scale_pulse(t)
         # On completion, snap to P2 and reset scale (defensive — Qt sometimes
         # emits valueChanged(1.0) slightly early and we want exact landing).
         if t >= 0.9999:
             self._pointer_pos = QPoint(int(self._flight_p2[0]), int(self._flight_p2[1]))
             self._flight_scale = 1.0
+        self.update()
+
+    def _finish_flight_visual(self) -> None:
+        self._is_flying = False
+        self._recent_pointer_positions.clear()
+        self._flight_scale = 1.0
         self.update()
 
     def apply_win32_clickthrough(self) -> None:
@@ -644,6 +826,7 @@ class OverlayWindow(QWidget):
         """
         if getattr(self, "_waveform_widget", None) is None:
             self._waveform_widget = WaveformWidget(self)
+        self.set_visual_state(_OverlayState.LISTENING)
         self._waveform_widget.show()
         self._waveform_visible = True
         self._pointer_visible = False  # cursor polygon hides during LISTENING
@@ -663,6 +846,7 @@ class OverlayWindow(QWidget):
         Position tracks cursor via _on_follow_tick, same as waveform."""
         if getattr(self, "_spinner_widget", None) is None:
             self._spinner_widget = SpinnerWidget(self)
+        self.set_visual_state(_OverlayState.THINKING)
         self._spinner_widget.show()
         self._spinner_visible = True
         self._pointer_visible = False
@@ -675,6 +859,8 @@ class OverlayWindow(QWidget):
         if getattr(self, "_spinner_widget", None) is not None:
             self._spinner_widget.hide()
         self._spinner_visible = False
+        if not self._waveform_visible:
+            self.set_visual_state(_OverlayState.IDLE)
         self.update()
 
     def set_audio_level(self, level: float) -> None:
@@ -733,12 +919,17 @@ class SpinnerWidget(QWidget):
 
         import time as _t
         self._phase_start = _t.time()
+        self._accent_rgb = _accent_rgb(_OverlayState.THINKING)
 
         self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(self.UPDATE_INTERVAL_MS)
 
     def _tick(self) -> None:
+        self.update()
+
+    def set_accent(self, rgb: tuple[int, int, int]) -> None:
+        self._accent_rgb = rgb
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -753,17 +944,14 @@ class SpinnerWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         # Center the arc in the widget + rotate by `angle` around the center.
-        cx = cy = self.WIDGET_SIZE / 2.0
-        painter.translate(cx, cy)
-        painter.rotate(angle)
-        painter.translate(-cx, -cy)
+        # Individual tail segments rotate from the current animation angle.
 
         # Outer glow — a faint circle slightly larger than the arc.
-        glow_pen = QPen(QColor(30, 144, 255, 90))
+        glow_pen = QPen(_with_alpha(self._accent_rgb, 45))
         glow_pen.setWidthF(_SPINNER_STROKE_WIDTH + 2.0)
         glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(glow_pen)
-        arc_rect = _QRectF(
+        arc_rect = QRectF(
             (self.WIDGET_SIZE - _SPINNER_ARC_DIAMETER) / 2.0,
             (self.WIDGET_SIZE - _SPINNER_ARC_DIAMETER) / 2.0,
             _SPINNER_ARC_DIAMETER,
@@ -772,19 +960,27 @@ class SpinnerWidget(QWidget):
         # QPainter.drawArc uses 1/16-degree units.
         painter.drawArc(
             arc_rect,
-            int(_SPINNER_ARC_START_DEG * 16),
-            int(_SPINNER_ARC_SPAN_DEG * 16),
+            int(angle * 16),
+            int(11 * 16),
         )
 
+        # Layer short, increasingly opaque round-capped arcs into a comet tail.
+        for start, opacity in reversed(_spinner_tail_segments(angle)):
+            tail_pen = QPen(_with_alpha(self._accent_rgb, int(235 * opacity)))
+            tail_pen.setWidthF(_SPINNER_STROKE_WIDTH)
+            tail_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(tail_pen)
+            painter.drawArc(arc_rect, int(start * 16), int(11 * 16))
+
         # Main arc — fully opaque dodger blue.
-        main_pen = QPen(QColor(30, 144, 255, 220))
+        main_pen = QPen(_with_alpha(self._accent_rgb, 230))
         main_pen.setWidthF(_SPINNER_STROKE_WIDTH)
         main_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(main_pen)
         painter.drawArc(
             arc_rect,
-            int(_SPINNER_ARC_START_DEG * 16),
-            int(_SPINNER_ARC_SPAN_DEG * 16),
+            int(angle * 16),
+            int(11 * 16),
         )
 
 
@@ -818,6 +1014,7 @@ class WaveformWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
         self._audio_level: float = 0.0
+        self._accent_rgb = _accent_rgb(_OverlayState.LISTENING)
         import time as _t
         self._phase_start = _t.time()
 
@@ -829,28 +1026,35 @@ class WaveformWidget(QWidget):
         """Update live audio level (called from app.py via pyqtSignal)."""
         self._audio_level = max(0.0, min(float(level), 1.0))
 
+    def set_accent(self, rgb: tuple[int, int, int]) -> None:
+        self._accent_rgb = rgb
+        self.update()
+
     def _tick(self) -> None:
         """Trigger a repaint on each timer tick — bars redraw at ~36 fps."""
         self.update()
 
     def paintEvent(self, _event) -> None:
         """Draw the 5 vertical bars centered vertically in the widget."""
-        from PyQt6.QtCore import QRectF as _QRectF  # local import: type only used here
         import time as _t
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        # Same dodger blue as cursor polygon
-        painter.setBrush(QColor(30, 144, 255, 220))
 
         phase = _t.time() - self._phase_start
         for i in range(_WAVEFORM_BAR_COUNT):
             bar_h = _waveform_bar_height(i, self._audio_level, phase)
             x = i * (self.BAR_WIDTH + self.BAR_SPACING)
             y = (self.WIDGET_HEIGHT - bar_h) / 2.0
+            rect = QRectF(float(x), float(y), float(self.BAR_WIDTH), float(bar_h))
+            bright = _waveform_color_rgb(self._audio_level, self._accent_rgb)
+            fill = QLinearGradient(float(x), float(y), float(x), float(y + bar_h))
+            fill.setColorAt(0.0, _with_alpha(bright, 245))
+            fill.setColorAt(1.0, _with_alpha(self._accent_rgb, 210))
+            painter.setBrush(fill)
             painter.drawRoundedRect(
-                _QRectF(float(x), float(y), float(self.BAR_WIDTH), float(bar_h)),
+                rect,
                 1.5, 1.5,
             )
 
@@ -1038,6 +1242,9 @@ class OverlayController:
         if self._state == _OverlayState.HIDDEN:
             return
         self._state = _OverlayState.IDLE
+        for overlay in self.overlays:
+            if hasattr(overlay, "set_visual_state"):
+                overlay.set_visual_state(_OverlayState.IDLE)
         self._follow_timer.start()
 
     def _overlay_for_screen(self, screen: QScreen) -> OverlayWindow | None:
