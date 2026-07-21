@@ -38,7 +38,13 @@ from PyQt6.QtCore import QObject
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QMenu, QMessageBox, QSystemTrayIcon
 
+import config
 from config import KB_DIR, MEMORY_DIR
+
+
+def _display_hotkey(hotkey: str) -> str:
+    """Turn pynput's persisted ``ctrl+alt+space`` form into readable UI text."""
+    return "+".join(part.capitalize() for part in hotkey.split("+"))
 
 
 class NimbusTray(QObject):
@@ -57,6 +63,7 @@ class NimbusTray(QObject):
         on_quit: Callable[[], None],
         on_settings: Callable[[], None],
         on_export_session_history: Callable[[], None] | None = None,
+        on_pause_changed: Callable[[bool], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -82,6 +89,7 @@ class NimbusTray(QObject):
         # Optional for backward compatibility with callers that only expose
         # Settings + Quit. The production app always supplies this callback.
         self._on_export_session_history = on_export_session_history or (lambda: None)
+        self._on_pause_changed = on_pause_changed or (lambda _paused: None)
 
         self._icon = QSystemTrayIcon(parent=self)
         self._icon.setToolTip("Nimbus — push-to-talk AI buddy")
@@ -93,6 +101,20 @@ class NimbusTray(QObject):
         self._build_menu()
         self._icon.setContextMenu(self._menu)
         self._icon.show()
+        self._show_onboarding_once()
+
+    def _show_onboarding_once(self) -> None:
+        """Show a native tray balloon exactly once after the icon is available."""
+        if config.onboarding_seen():
+            return
+        self._icon.showMessage(
+            "Nimbus is running",
+            f"Hold {_display_hotkey(config.HOTKEY)} to talk to Nimbus. "
+            "Right-click this icon to open Settings.",
+            QSystemTrayIcon.MessageIcon.Information,
+            8_000,
+        )
+        config.mark_onboarding_seen()
 
     # ---------- Menu construction ---------------------------------------
 
@@ -100,6 +122,11 @@ class NimbusTray(QObject):
         act_settings = QAction("Settings...", self)
         act_settings.triggered.connect(self._on_settings)
         self._menu.addAction(act_settings)
+
+        self._pause_action = QAction("Pause push-to-talk", self)
+        self._pause_action.setCheckable(True)
+        self._pause_action.toggled.connect(self._on_pause_changed)
+        self._menu.addAction(self._pause_action)
 
         act_open_kb = QAction("Open Knowledge Folder", self)
         act_open_kb.triggered.connect(self._open_kb_folder)

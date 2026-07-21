@@ -103,6 +103,7 @@ def resolve_bounded_int_setting(name: str, default: int, minimum: int, maximum: 
 # in a file: Credential Manager survives a portable/frozen install move and is
 # already the app's source of truth for user preferences.
 ONBOARDING_SEEN_KEY = "SEEN_ONBOARDING"
+WELCOME_SEEN_KEY = "SEEN_WELCOME"
 
 
 def onboarding_seen() -> bool:
@@ -123,6 +124,22 @@ def mark_onboarding_seen() -> bool:
     """Persist successful onboarding display; return False if keyring is unavailable."""
     try:
         keyring.set_password(KEYRING_SERVICE, ONBOARDING_SEEN_KEY, "1")
+    except Exception:
+        return False
+    return True
+
+
+def welcome_seen() -> bool:
+    """Whether the full first-run welcome/permissions dialog was completed."""
+    try:
+        return keyring.get_password(KEYRING_SERVICE, WELCOME_SEEN_KEY) == "1"
+    except Exception:
+        return False
+
+
+def mark_welcome_seen() -> bool:
+    try:
+        keyring.set_password(KEYRING_SERVICE, WELCOME_SEEN_KEY, "1")
     except Exception:
         return False
     return True

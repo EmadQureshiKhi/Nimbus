@@ -27,6 +27,11 @@ def test_tray_module_importable():
 class TestNimbusTrayMenu:
     """The tray menu exposes settings, folders, session export, and quit."""
 
+    @pytest.fixture(autouse=True)
+    def _suppress_real_onboarding_persistence(self, mocker):
+        """Tray construction must never write the developer's real keyring."""
+        mocker.patch("tray.config.onboarding_seen", return_value=True)
+
     def test_menu_has_five_actions_in_order(self, qapp, mocker):
         """The 5 visible menu items + 1 separator. Verified by reading
         QMenu.actions() in order."""
@@ -44,6 +49,7 @@ class TestNimbusTrayMenu:
         labels = [a.text() for a in actions]
         assert labels == [
             "Settings...",
+            "Pause push-to-talk",
             "Open Knowledge Folder",
             "Open Memory Folder",
             "Export Session History",
@@ -64,6 +70,44 @@ class TestNimbusTrayMenu:
         )
         action.trigger()
         on_export.assert_called_once()
+
+    def test_pause_action_is_checkable_and_notifies_app(self, qapp, mocker):
+        from tray import NimbusTray
+        changed = mocker.MagicMock()
+        tray = NimbusTray(
+            on_quit=mocker.MagicMock(), on_settings=mocker.MagicMock(),
+            on_pause_changed=changed,
+        )
+        action = next(a for a in tray._menu.actions() if a.text() == "Pause push-to-talk")
+        assert action.isCheckable()
+        action.trigger()
+        changed.assert_called_once_with(True)
+
+    def test_first_launch_shows_configured_hotkey_onboarding_once(self, qapp, mocker):
+        """The balloon uses config.HOTKEY and only marks state after display."""
+        mocker.patch("tray.config.onboarding_seen", return_value=False)
+        marked = mocker.patch("tray.config.mark_onboarding_seen")
+        mocker.patch("tray.config.HOTKEY", "ctrl+shift+f2")
+        show_message = mocker.patch("tray.QSystemTrayIcon.showMessage")
+
+        from tray import NimbusTray
+        NimbusTray(on_quit=mocker.MagicMock(), on_settings=mocker.MagicMock())
+
+        show_message.assert_called_once()
+        assert "Ctrl+Shift+F2" in show_message.call_args.args[1]
+        assert "Right-click" in show_message.call_args.args[1]
+        marked.assert_called_once()
+
+    def test_seen_onboarding_never_shows_again(self, qapp, mocker):
+        mocker.patch("tray.config.onboarding_seen", return_value=True)
+        marked = mocker.patch("tray.config.mark_onboarding_seen")
+        show_message = mocker.patch("tray.QSystemTrayIcon.showMessage")
+
+        from tray import NimbusTray
+        NimbusTray(on_quit=mocker.MagicMock(), on_settings=mocker.MagicMock())
+
+        show_message.assert_not_called()
+        marked.assert_not_called()
 
     def test_quit_action_triggers_on_quit_callback(self, qapp, mocker):
         from tray import NimbusTray
