@@ -29,6 +29,7 @@ debug_*.jpg
 debug_*.png
 scratch_*
 *.log
+exports/
 
 # Model caches (downloaded on first run, large)
 whisper-cache/

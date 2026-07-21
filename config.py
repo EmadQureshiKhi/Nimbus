@@ -15,7 +15,11 @@ from pathlib import Path
 import keyring
 from dotenv import load_dotenv
 
-load_dotenv()
+# CI must exercise a clean environment even if a runner or future test setup
+# happens to place a .env file beside the checkout. Production keeps the
+# convenient local .env workflow; GitHub Actions sets this guard explicitly.
+if os.getenv("NIMBUS_DISABLE_DOTENV") != "1":
+    load_dotenv()
 
 
 # ── Secrets resolution (env → keyring with one-shot migration) ──────────────

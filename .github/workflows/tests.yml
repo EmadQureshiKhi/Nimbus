@@ -1,0 +1,32 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Windows, Python 3.13)
+    runs-on: windows-latest
+    env:
+      # Do not let a checked-out or runner-provided .env influence CI.
+      NIMBUS_DISABLE_DOTENV: "1"
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip; python -m pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest -q

@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/license-MIT-f4d35e" alt="MIT" />
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4" alt="Windows 10/11" />
   <img src="https://img.shields.io/badge/powered%20by-OpenAI-10a37f" alt="OpenAI" />
+  <a href="https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml"><img src="https://github.com/EmadQureshiKhi/Nimbus/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
 </p>
 
 ## What it does
