@@ -180,8 +180,8 @@ This runtime AI is independent of the **GPT-5.6 model that powered development t
 
 ## Submission info
 
-- Demo video: [TODO: YouTube URL]
-- Codex /feedback session ID: [TODO: session ID]
+- Demo video: https://youtu.be/GZW97NDSOkk
+- Codex /feedback session ID: 019f83a1-36a4-75a2-870b-d29421d4d1d5
 - Code repository: https://github.com/EmadQureshiKhi/Nimbus
 
 ## License
