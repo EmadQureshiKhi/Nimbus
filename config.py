@@ -90,6 +90,44 @@ def resolve_setting(name: str, default: str) -> str:
     return stored if stored else default
 
 
+def resolve_bounded_int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Resolve an integer setting without letting a corrupt keyring value crash startup."""
+    try:
+        value = int(resolve_setting(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+# First-launch UX state is intentionally stored alongside settings rather than
+# in a file: Credential Manager survives a portable/frozen install move and is
+# already the app's source of truth for user preferences.
+ONBOARDING_SEEN_KEY = "SEEN_ONBOARDING"
+
+
+def onboarding_seen() -> bool:
+    """Whether the one-time tray onboarding balloon was already displayed."""
+    # Unlike ordinary settings, an environment value must not be able to make
+    # a shown onboarding balloon reappear on every launch. This is strictly a
+    # local, one-way keyring flag.
+    try:
+        stored = keyring.get_password(KEYRING_SERVICE, ONBOARDING_SEEN_KEY)
+    except Exception:
+        stored = None
+    return (stored or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def mark_onboarding_seen() -> bool:
+    """Persist successful onboarding display; return False if keyring is unavailable."""
+    try:
+        keyring.set_password(KEYRING_SERVICE, ONBOARDING_SEEN_KEY, "1")
+    except Exception:
+        return False
+    return True
+
+
 # ── API keys ─────────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY: str | None = resolve_api_key("ANTHROPIC_API_KEY")
@@ -278,6 +316,19 @@ import (env→keyring→default); app.py reads this cached constant per interact
 rather than calling resolve_setting on the hot path, so there is no
 per-interaction keyring read/write latency. Set it in .env and restart to
 toggle."""
+
+DIAGNOSTIC_CAPTURE: str = resolve_setting("DIAGNOSTIC_CAPTURE", default="off")
+"""Whether Nimbus writes diagnostic screenshots and interaction logs locally.
+
+Disabled by default so normal release use does not retain screen contents or
+transcripts. Developers can enable it from Settings when investigating an
+issue; the change takes effect after Nimbus restarts.
+"""
+
+DIAGNOSTIC_RETENTION_DAYS: int = resolve_bounded_int_setting(
+    "DIAGNOSTIC_RETENTION_DAYS", default=7, minimum=1, maximum=365
+)
+"""How many days enabled diagnostic sessions are retained (1..365)."""
 
 
 # ── ElevenLabs TTS (opt-in alternative to Cartesia) ─────────────────────────

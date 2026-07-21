@@ -2047,6 +2047,11 @@ if __name__ == "__main__":
         dlg = SettingsDialog()
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
+        if dlg._local_data_cleared:
+            _log("Nimbus local data cleared; closing for a clean restart.")
+            nimbus.stop()
+            qt_app.quit()
+            return
         _log("Settings saved.")
         # providers/models are built ONCE at startup, so a Settings
         # change can't affect the already-running instance. An earlier attempt

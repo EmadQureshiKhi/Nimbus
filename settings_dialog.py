@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 
 import keyring
 
@@ -39,11 +40,57 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from config import KEYRING_SERVICE
+
+
+_LOCAL_KEYRING_ENTRIES = (
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+    "ASSEMBLYAI_API_KEY", "CARTESIA_API_KEY", "ELEVENLABS_API_KEY",
+    "LLM_PROVIDER", "STT_PROVIDER", "TTS_PROVIDER", "ANNOTATION_MODE",
+    "HOTKEY", "OLLAMA_HOST", "OLLAMA_MODEL_VISION", "OLLAMA_MODEL_TEXT",
+    "OPENAI_MODEL_VISION", "ANTHROPIC_MODEL", "FASTER_WHISPER_MODEL",
+    "FASTER_WHISPER_DEVICE", "FASTER_WHISPER_COMPUTE", "KOKORO_VOICE",
+    "DIAGNOSTIC_CAPTURE", "DIAGNOSTIC_RETENTION_DAYS",
+)
+
+
+def clear_local_nimbus_data(data_root: Path, kb_dir: Path) -> list[str]:
+    """Clear Nimbus-owned files and saved settings, returning any failures.
+
+    The directory roots themselves are preserved so a running process can
+    recreate a database or diagnostics folder cleanly. User-created exports
+    are deliberately excluded: they are explicit documents, not app state.
+    """
+    failures: list[str] = []
+    for root in (data_root, kb_dir):
+        if not root.exists():
+            continue
+        try:
+            children = list(root.iterdir())
+        except OSError as exc:
+            failures.append(f"{root}: {exc}")
+            continue
+        for child in children:
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except OSError as exc:
+                failures.append(f"{child}: {exc}")
+    for name in _LOCAL_KEYRING_ENTRIES:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, name)
+        except Exception:
+            # Missing entries and locked credential stores are non-fatal; the
+            # filesystem result is still useful and reported separately.
+            continue
+    return failures
 
 
 # pre-populated Ollama vision model suggestions
@@ -283,6 +330,9 @@ class SettingsDialog(QDialog):
         self._realtime_note: QLabel | None = None
         self._draw_checkbox: QCheckBox | None = None
         self._hotkey_input: QLineEdit | None = None
+        self._diagnostic_capture_checkbox: QCheckBox | None = None
+        self._diagnostic_retention_days: QSpinBox | None = None
+        self._local_data_cleared = False
         self._build_ui()
 
     # ---------- UI construction -----------------------------------------
@@ -335,6 +385,42 @@ class SettingsDialog(QDialog):
         restart_note = QLabel("Hotkey changes take effect the next time Nimbus starts.")
         restart_note.setStyleSheet("color: gray; padding-bottom: 2px;")
         outer.addWidget(restart_note)
+
+        diagnostic_row = QHBoxLayout()
+        self._diagnostic_capture_checkbox = QCheckBox(
+            "Save diagnostic screenshots and interaction logs"
+        )
+        self._diagnostic_capture_checkbox.setChecked(
+            resolve_setting("DIAGNOSTIC_CAPTURE", "off") == "on"
+        )
+        self._diagnostic_capture_checkbox.setToolTip(
+            "Off by default. Enable only while troubleshooting; captures may contain sensitive screen content."
+        )
+        diagnostic_row.addWidget(self._diagnostic_capture_checkbox, stretch=1)
+        diagnostic_row.addWidget(QLabel("Keep for:"))
+        self._diagnostic_retention_days = QSpinBox()
+        self._diagnostic_retention_days.setRange(1, 365)
+        self._diagnostic_retention_days.setSuffix(" days")
+        try:
+            saved_retention = int(resolve_setting("DIAGNOSTIC_RETENTION_DAYS", "7"))
+        except ValueError:
+            saved_retention = 7
+        self._diagnostic_retention_days.setValue(max(1, min(365, saved_retention)))
+        diagnostic_row.addWidget(self._diagnostic_retention_days)
+        outer.addLayout(diagnostic_row)
+        self._diagnostic_capture_checkbox.toggled.connect(
+            self._diagnostic_retention_days.setEnabled
+        )
+        self._diagnostic_retention_days.setEnabled(
+            self._diagnostic_capture_checkbox.isChecked()
+        )
+
+        clear_button = QPushButton("Clear all Nimbus local data…")
+        clear_button.setToolTip(
+            "Deletes Nimbus memory, diagnostics, Knowledge Folder contents, and saved Nimbus settings/API keys."
+        )
+        clear_button.clicked.connect(self._on_clear_local_data)
+        outer.addWidget(clear_button)
 
         self._reveal = QCheckBox("Show keys in plain text (paste-verify)")
         self._reveal.toggled.connect(self._on_reveal_toggled)
@@ -686,7 +772,45 @@ class SettingsDialog(QDialog):
                 "ANNOTATION_MODE",
                 "on" if self._draw_checkbox.isChecked() else "off",
             )
+        if self._diagnostic_capture_checkbox is not None:
+            keyring.set_password(
+                KEYRING_SERVICE,
+                "DIAGNOSTIC_CAPTURE",
+                "on" if self._diagnostic_capture_checkbox.isChecked() else "off",
+            )
+        if self._diagnostic_retention_days is not None:
+            keyring.set_password(
+                KEYRING_SERVICE,
+                "DIAGNOSTIC_RETENTION_DAYS",
+                str(self._diagnostic_retention_days.value()),
+            )
         keyring.set_password(KEYRING_SERVICE, "HOTKEY", hotkey_value)
+        self.accept()
+
+    def _on_clear_local_data(self) -> None:
+        """Confirm then remove Nimbus-owned local state and restart cleanly."""
+        from config import KB_DIR, MEMORY_DIR
+
+        answer = QMessageBox.question(
+            self,
+            "Clear all Nimbus local data?",
+            "This permanently deletes Nimbus memories, diagnostics, Knowledge "
+            "Folder contents, and saved Nimbus settings/API keys.\n\n"
+            "Session-history exports are not deleted. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        failures = clear_local_nimbus_data(Path(MEMORY_DIR).parent, Path(KB_DIR))
+        self._local_data_cleared = True
+        details = "\n\nSome items could not be removed:\n" + "\n".join(failures) if failures else ""
+        QMessageBox.information(
+            self,
+            "Nimbus local data cleared",
+            "Nimbus will now close. Reopen it to start with a clean setup."
+            + details,
+        )
         self.accept()
 
     def _confirm_ollama_compat(self, model: str) -> bool:

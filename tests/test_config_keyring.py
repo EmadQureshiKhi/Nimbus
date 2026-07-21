@@ -157,6 +157,33 @@ class TestResolveSetting:
         assert resolve_setting("TTS_PROVIDER", default="cartesia") == "elevenlabs"
 
 
+class TestBoundedIntegerSettings:
+    def test_invalid_retention_value_falls_back_without_crashing(self, monkeypatch, fake_keyring):
+        monkeypatch.delenv("DIAGNOSTIC_RETENTION_DAYS", raising=False)
+        fake_keyring[("nimbus", "DIAGNOSTIC_RETENTION_DAYS")] = "not-a-number"
+        from config import resolve_bounded_int_setting
+        assert resolve_bounded_int_setting("DIAGNOSTIC_RETENTION_DAYS", 7, 1, 365) == 7
+
+    def test_retention_value_is_clamped(self, monkeypatch, fake_keyring):
+        monkeypatch.setenv("DIAGNOSTIC_RETENTION_DAYS", "9999")
+        from config import resolve_bounded_int_setting
+        assert resolve_bounded_int_setting("DIAGNOSTIC_RETENTION_DAYS", 7, 1, 365) == 365
+
+
+class TestOnboardingFlag:
+    def test_onboarding_seen_reads_false_then_true_from_keyring(self, monkeypatch, fake_keyring):
+        from config import KEYRING_SERVICE, ONBOARDING_SEEN_KEY, onboarding_seen
+        monkeypatch.delenv(ONBOARDING_SEEN_KEY, raising=False)
+        assert onboarding_seen() is False
+        fake_keyring[(KEYRING_SERVICE, ONBOARDING_SEEN_KEY)] = "1"
+        assert onboarding_seen() is True
+
+    def test_mark_onboarding_seen_persists_flag(self, fake_keyring):
+        from config import KEYRING_SERVICE, ONBOARDING_SEEN_KEY, mark_onboarding_seen
+        assert mark_onboarding_seen() is True
+        assert fake_keyring[(KEYRING_SERVICE, ONBOARDING_SEEN_KEY)] == "1"
+
+
 def test_resolve_kb_dir_falls_back_when_documents_cannot_create_child(tmp_path):
     """A broken/managed Documents path must not break the tray KB shortcut."""
     from config import _resolve_kb_dir

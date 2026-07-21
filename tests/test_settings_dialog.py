@@ -467,6 +467,45 @@ class TestSettingsDialogSave:
         error.assert_called_once()
         assert saved == {}
 
+    def test_save_persists_diagnostic_preferences(self, qapp, monkeypatch):
+        saved: dict[tuple[str, str], str] = {}
+        monkeypatch.setattr("settings_dialog.keyring.get_password", lambda s, n: None)
+        monkeypatch.setattr(
+            "settings_dialog.keyring.set_password",
+            lambda s, n, v: saved.update({(s, n): v}),
+        )
+        from settings_dialog import SettingsDialog
+        dlg = SettingsDialog()
+        dlg._key_inputs["LLM"].setText("a")
+        dlg._key_inputs["STT"].setText("b")
+        dlg._key_inputs["TTS"].setText("c")
+        dlg._diagnostic_capture_checkbox.setChecked(True)
+        dlg._diagnostic_retention_days.setValue(14)
+        dlg._on_save()
+        assert saved[("nimbus", "DIAGNOSTIC_CAPTURE")] == "on"
+        assert saved[("nimbus", "DIAGNOSTIC_RETENTION_DAYS")] == "14"
+
+
+class TestClearLocalNimbusData:
+    def test_clear_removes_app_state_and_knowledge_but_not_roots(self, tmp_path, monkeypatch):
+        data_root = tmp_path / "nimbus"
+        knowledge = tmp_path / "Nimbus Wiki"
+        (data_root / "debug").mkdir(parents=True)
+        (data_root / "debug" / "screen.jpg").write_text("x")
+        knowledge.mkdir()
+        (knowledge / "app.md").write_text("private")
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            "settings_dialog.keyring.delete_password",
+            lambda _service, name: deleted.append(name),
+        )
+        from settings_dialog import _LOCAL_KEYRING_ENTRIES, clear_local_nimbus_data
+        assert clear_local_nimbus_data(data_root, knowledge) == []
+        assert data_root.exists() and knowledge.exists()
+        assert list(data_root.iterdir()) == []
+        assert list(knowledge.iterdir()) == []
+        assert set(deleted) == set(_LOCAL_KEYRING_ENTRIES)
+
 
 # --- Ollama model dropdown + compat warn -------
 

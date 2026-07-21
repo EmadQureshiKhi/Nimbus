@@ -16,10 +16,41 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from config import MEMORY_DIR
+from config import DIAGNOSTIC_CAPTURE, DIAGNOSTIC_RETENTION_DAYS, MEMORY_DIR
 
 
 _DEBUG_DIR = Path(MEMORY_DIR).parent / "debug"
+
+
+class _NullDebugSession:
+    """No-op diagnostic session used when capture is disabled or unavailable.
+
+    The interaction pipeline must never fail because optional diagnostics
+    cannot be written. It deliberately exposes the same small API as
+    :class:`DebugSession` so callers need no special error path.
+    """
+
+    def log(self, _msg: str) -> None:
+        pass
+
+    def save_screenshot(self, _pil_image, filename: str = "screenshot.jpg", coordinate=None) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _prune_old_sessions(debug_dir: Path, retention_days: int) -> None:
+    """Remove only expired session folders beneath Nimbus's debug directory."""
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    for child in debug_dir.iterdir():
+        try:
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                import shutil
+                shutil.rmtree(child)
+        except OSError:
+            # Retention is best effort; a locked image must not block Nimbus.
+            continue
 
 
 class DebugSession:
@@ -31,13 +62,20 @@ class DebugSession:
         self._t0 = time.time()
 
     @classmethod
-    def start(cls, app_name: str, window_title: str) -> DebugSession:
+    def start(cls, app_name: str, window_title: str) -> DebugSession | _NullDebugSession:
+        if DIAGNOSTIC_CAPTURE != "on":
+            return _NullDebugSession()
         ts = time.strftime("%Y-%m-%d_%H-%M-%S")
         safe_app = app_name.replace("/", "_").replace("\\", "_")
         folder = _DEBUG_DIR / f"{ts}_{safe_app}"
-        folder.mkdir(parents=True, exist_ok=True)
-        log_path = folder / "interaction.log"
-        f = open(log_path, "w", encoding="utf-8")
+        try:
+            _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            _prune_old_sessions(_DEBUG_DIR, DIAGNOSTIC_RETENTION_DAYS)
+            folder.mkdir(parents=True, exist_ok=True)
+            log_path = folder / "interaction.log"
+            f = open(log_path, "w", encoding="utf-8")
+        except OSError:
+            return _NullDebugSession()
         session = cls(folder, f)
         session.log(f"APP: {app_name}")
         session.log(f"WINDOW: {window_title}")
