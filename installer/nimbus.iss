@@ -14,7 +14,9 @@
 ; Inno Setup 6+ required: https://jrsoftware.org/isdl.php (free).
 
 #define AppName "Nimbus"
+#ifndef AppVersion
 #define AppVersion "1.0.0"
+#endif
 #define AppPublisher "The Nimbus Authors"
 #define AppURL "https://github.com/EmadQureshiKhi/nimbus"
 #define AppExeName "Nimbus.exe"

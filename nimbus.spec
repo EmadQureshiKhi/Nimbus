@@ -142,6 +142,9 @@ a = Analysis(
         "keyring",
         "keyring.backends",
         "keyring.backends.Windows",
+        # Startup release notification + build-time version identifier.
+        "updates",
+        "version",
         *_local_hidden,  # submodules pulled by collect_all for the local stack
     ],
     hookspath=[],
