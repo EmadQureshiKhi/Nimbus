@@ -25,32 +25,83 @@ There is also a **teaching mode** (toggle *Draw on screen* in Settings). Instead
 
 Everything runs through your own API key. Nothing routes through a proxy server. See [Privacy](#privacy) for the specifics.
 
-## Quick start (from source)
+## Install Nimbus
+
+Nimbus supports Windows 10/11 on 64-bit PCs. You can either install a ready-to-run release or run it from this repository.
+
+### Option A: install without the repository
+
+1. Open the [Nimbus Releases page](https://github.com/EmadQureshiKhi/Nimbus/releases) and download the latest `Nimbus-Windows-Setup-v*.exe` file.
+2. Run the installer. It installs only for your Windows account, so it does not need administrator access.
+3. Leave **Run Nimbus** selected at the end of setup, or open Nimbus later from the Start menu or desktop shortcut.
+4. On first launch, choose your providers in Settings. The simplest setup is **OpenAI** for LLM, **faster-whisper (local)** for speech-to-text, and **Kokoro (local)** for speech output; enter only your OpenAI API key.
+5. Nimbus appears as a blue cursor icon in the Windows system tray. Right-click it for Settings, your knowledge/memory folders, session export, or Quit.
+
+Nimbus checks GitHub Releases when it starts. When a newer version is published, it shows an **Update available** message; select **Open** to download the new installer and run it to update Nimbus.
+
+### Option B: run from this repository
 
 Requires Windows 10/11 and Python 3.13.
 
 ```powershell
-# 1. Create and activate a virtual environment
+# 1. Clone the repository and enter it
+git clone https://github.com/EmadQureshiKhi/Nimbus.git
+cd Nimbus
+
+# 2. Create and activate a virtual environment
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 2. Install dependencies
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 3. Add your key (copy .env.example to .env and fill it in)
+# 4. Add your key (copy .env.example to .env and fill it in)
 #    Minimal setup: OpenAI for the LLM, local models for speech in/out.
 #      OPENAI_API_KEY=sk-...
 #      LLM_PROVIDER=openai
 #      STT_PROVIDER=faster-whisper   # local, no key
 #      TTS_PROVIDER=kokoro           # local, no key
 
-# 4. Run it
+# 5. Run it
 py -3.13 -m app
 ```
 
-Nimbus runs from the **system tray** (blue cursor icon). Right-click it for Settings and Quit. Hold `Ctrl+Alt+Space`, ask a question, release.
+## Use Nimbus
+
+1. Start Nimbus. It runs from the **system tray** rather than opening a normal app window.
+2. Open the app or webpage you want help with and place your cursor near the relevant area.
+3. Hold `Ctrl+Alt+Space`, speak your question, then release the keys.
+4. Nimbus captures the screen, answers out loud, and moves its blue cursor to a relevant control when useful.
+5. Right-click the tray icon to change providers/keys, export the current session, open your knowledge folder, or quit.
+
+If another application already uses `Ctrl+Alt+Space`, change that application’s shortcut so Nimbus can receive the hotkey. Nimbus observes the combination and does not block normal typing.
 
 On first run the local speech models download once (~150 MB for speech-to-text, ~330 MB for the voice), so the first interaction is slower. After that it is fast.
+
+## Build from source
+
+Build the Windows onedir distributable from an activated Python 3.13 environment:
+
+```powershell
+py -3.13 -m PyInstaller nimbus.spec --noconfirm
+```
+
+The executable is written to `dist\Nimbus\Nimbus.exe`. Before launching it normally, verify the frozen bundle has every runtime import and native DLL without opening a tray window, microphone, or network connection:
+
+```powershell
+dist\Nimbus\Nimbus.exe --selftest
+# SELFTEST OK
+```
+
+To make the optional installer after a successful PyInstaller build, install Inno Setup 6+ and run:
+
+```powershell
+iscc installer\nimbus.iss
+```
+
+This produces `installer\Output\Nimbus-Windows-Setup-v1.0.0.exe`. Inno Setup is not a Python dependency; if `iscc` is unavailable, install it separately or skip this optional installer step.
+
+Every push to `main` also runs the release workflow. After tests pass, GitHub Actions builds the installer, publishes a new GitHub Release, and marks it as the latest download. The release version is automatically `1.0.<GitHub run number>`.
 
 ### Providers
 
