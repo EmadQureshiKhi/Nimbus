@@ -341,12 +341,12 @@ class TestNimbusApp:
         app._on_clear_annotations()
         app._overlay.clear_all_annotations.assert_called_once()
 
-    def test_press_handler_plays_listening_chime(self, mocker):
+    def test_press_handler_plays_listening_tone(self, mocker):
         """_handle_press plays a short chime the moment the
         hotkey goes down so the user has immediate feedback 'mic is hot, keep
         talking'. Must be non-blocking (0ms pipeline latency)."""
         import app as app_module
-        play_spy = mocker.patch.object(app_module, "_play_chime_async")
+        play_spy = mocker.patch.object(app_module, "_play_feedback_tone_async")
         mocker.patch("app.get_foreground_app", return_value=("EXCEL.EXE", "Sheet1"))
         mocker.patch("app.get_cursor_position", return_value=(100, 100))
         mocker.patch("app.capture_all_screens", return_value=[mocker.MagicMock()])
@@ -356,7 +356,7 @@ class TestNimbusApp:
         if app._capture_thread is not None:
             app._capture_thread.join(timeout=2.0)
 
-        play_spy.assert_called_once()
+        play_spy.assert_called_once_with("listening")
 
     def test_press_handler_kicks_off_capture_in_background(self, mocker):
         """_handle_press starts capture_all_screens + memory.recall on a

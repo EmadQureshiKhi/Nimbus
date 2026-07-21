@@ -1059,6 +1059,43 @@ class WaveformWidget(QWidget):
             )
 
 
+class ToastWidget(QWidget):
+    """A compact click-through status toast hosted by one overlay window."""
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._message = ""
+        self._severity = "error"
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+
+    def show_toast(self, message: str, severity: str = "error") -> None:
+        self._message, self._severity = message, severity
+        self.resize(390, 58)
+        if self.parentWidget() is not None:
+            parent = self.parentWidget()
+            self.move(max(16, parent.width() - self.width() - 24), 28)
+        self.show()
+        self.raise_()
+        self._timer.start(5_000)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rgb = (239, 68, 68) if self._severity == "error" else (59, 130, 246)
+        rect = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        painter.setPen(QPen(_with_alpha(rgb, 190), 1))
+        painter.setBrush(_with_alpha((10, 18, 35), 235))
+        painter.drawRoundedRect(rect, 12, 12)
+        painter.setPen(_with_alpha((255, 255, 255), 245))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
+        painter.drawText(rect.adjusted(16, 8, -16, -8), Qt.TextFlag.TextWordWrap, self._message)
+
+
 # --- Controller --------------------------------------------------------------
 
 class OverlayController:
@@ -1280,6 +1317,13 @@ class OverlayController:
         cancelled / errored turn (they'd otherwise linger until the 30s timer)."""
         for overlay in self.overlays:
             overlay.clear_annotations()
+
+    def show_toast(self, message: str, severity: str = "error") -> None:
+        """Show a non-modal error/status message on the active overlay."""
+        for overlay in self.overlays:
+            if not hasattr(overlay, "_toast_widget"):
+                overlay._toast_widget = ToastWidget(overlay)
+            overlay._toast_widget.show_toast(message, severity)
 
     def hide_for_capture(self) -> None:
         """Hide ALL overlays + stop timer for screen capture."""

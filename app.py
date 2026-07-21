@@ -466,6 +466,7 @@ class NimbusApp(QObject):
     # Update checks run off the UI thread; only this signal is allowed to show
     # the user-facing dialog on Qt's main thread.
     sig_update_available = pyqtSignal(str, str)
+    sig_show_toast = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -542,6 +543,7 @@ class NimbusApp(QObject):
         self.sig_clear_annotations.connect(self._on_clear_annotations)
         self.sig_export_session_history.connect(self._on_export_session_history)
         self.sig_update_available.connect(self._on_update_available)
+        self.sig_show_toast.connect(self._on_show_toast)
 
     def start(self) -> None:
         """Initialize overlay + hotkey and begin listening.
@@ -701,6 +703,8 @@ class NimbusApp(QObject):
     def _handle_press(self) -> None:
         """Hotkey pressed: kill TTS + start recording + capture foreground app."""
         import time
+        if self._hotkey is not None and not getattr(self._hotkey, "enabled", True):
+            return
         # GPT-Realtime mode takes a separate path — stream mic to the
         # realtime WS instead of STT. The normal STT/AI/TTS chain is skipped.
         if self._realtime is not None:
@@ -746,7 +750,7 @@ class NimbusApp(QObject):
         # "mic is hot" feedback. First call triggers sample generation
         # (~5ms CPU) + sounddevice cold-path init (~400ms on fresh portaudio).
         # Both are one-time costs amortized across the session.
-        _play_chime_async()
+        _play_feedback_tone_async("listening")
         # Check if TTS thread actually died
         tts_thread = self._tts._current_thread
         tts_alive = tts_thread.is_alive() if tts_thread else False
@@ -757,6 +761,8 @@ class NimbusApp(QObject):
             self._stt.start_recording()
             _log(f"  start_recording() in {(time.time()-t0)*1000:.0f}ms")
         except RuntimeError as exc:
+            self.sig_show_toast.emit("Microphone couldn't start. Check Settings and try again.", "error")
+            _play_feedback_tone_async("error")
             _log(f"ERROR: STT start failed — {exc}")
             return
 
@@ -1366,9 +1372,12 @@ class NimbusApp(QObject):
                 ):]
 
             dbg.log("DONE — interaction complete")
+            _play_feedback_tone_async("done")
 
         except Exception as exc:
             if not cancel.is_set():
+                self.sig_show_toast.emit("Nimbus couldn't complete that request. Please try again.", "error")
+                _play_feedback_tone_async("error")
                 dbg.log(f"ERROR: {type(exc).__name__}: {exc}")
                 _log(f"ERROR: Pipeline failed — {type(exc).__name__}: {exc}")
         finally:
@@ -1391,6 +1400,11 @@ class NimbusApp(QObject):
     def _on_point_at(self, physical_x: int, physical_y: int, monitor: dict) -> None:
         if self._overlay:
             self._overlay.point_at(physical_x, physical_y, monitor)
+
+    def _on_show_toast(self, message: str, severity: str) -> None:
+        """Main-thread bridge for non-blocking in-overlay error feedback."""
+        if self._overlay and hasattr(self._overlay, "show_toast"):
+            self._overlay.show_toast(message, severity)
 
     def _on_record_memory(
         self,
@@ -1632,6 +1646,38 @@ def _acquire_single_instance_mutex(kernel32=None):
 
 _CHIME_SAMPLE_RATE = 44100
 _CHIME_SAMPLES = None  # float32 numpy array, built on first play
+_FEEDBACK_TONES: dict[str, object] = {}
+
+
+def _feedback_tone_spec(kind: str) -> tuple[tuple[float, ...], float]:
+    """Distinct, short cues for listening, success, and recoverable errors."""
+    specs = {
+        "listening": ((880.0,), 0.060),
+        "done": ((659.0, 880.0), 0.110),
+        "error": ((330.0, 247.0), 0.140),
+    }
+    return specs.get(kind, specs["listening"])
+
+
+def _play_feedback_tone_async(kind: str) -> None:
+    """Play a generated, non-blocking interaction cue without external assets."""
+    try:
+        import numpy as _np
+        import sounddevice as _sd
+        samples = _FEEDBACK_TONES.get(kind)
+        if samples is None:
+            freqs, duration_s = _feedback_tone_spec(kind)
+            frames_per_note = int(_CHIME_SAMPLE_RATE * duration_s / len(freqs))
+            pieces = []
+            for freq in freqs:
+                t = _np.linspace(0.0, duration_s / len(freqs), frames_per_note, endpoint=False)
+                envelope = _np.exp(-t * 30.0)
+                pieces.append(_np.sin(2.0 * _np.pi * freq * t) * envelope * 0.22)
+            samples = _np.concatenate(pieces).astype(_np.float32)
+            _FEEDBACK_TONES[kind] = samples
+        _sd.play(samples, _CHIME_SAMPLE_RATE)
+    except Exception:
+        pass
 
 
 def _play_chime_async() -> None:
@@ -1645,6 +1691,9 @@ def _play_chime_async() -> None:
     Errors are swallowed — the chime is UX-only; if sounddevice / the audio
     device is unavailable, we silently skip rather than break the PTT flow.
     """
+    # Backward-compatible private alias for older integrations/tests.
+    _play_feedback_tone_async("listening")
+    return
     global _CHIME_SAMPLES
     try:
         import sounddevice as _sd
@@ -1843,7 +1892,7 @@ def _run_selftest() -> None:
 
     runtime_modules = (
         "ai", "stt", "tts", "overlay", "memory", "kb", "capture",
-        "hotkey", "realtime", "settings_dialog", "tray", "config",
+        "hotkey", "realtime", "settings_dialog", "onboarding", "tray", "config",
         "updates", "version",
     )
     for module_name in runtime_modules:
@@ -1923,6 +1972,16 @@ if __name__ == "__main__":
                 "missing. Aborting."
             )
             sys.exit(1)
+
+    # A fuller first-run explanation follows setup and is independent from the
+    # short tray balloon. It is deliberately non-destructive: dismissing it
+    # merely postpones the reminder until the next launch.
+    from config import mark_welcome_seen, welcome_seen
+    if not welcome_seen():
+        from onboarding import WelcomeDialog
+        welcome = WelcomeDialog(HOTKEY)
+        if welcome.exec() == welcome.DialogCode.Accepted:
+            mark_welcome_seen()
 
     # Resolve keys AFTER the modal has run — module-level constants
     # were captured at import time and may not reflect newly-saved
@@ -2074,6 +2133,16 @@ if __name__ == "__main__":
         # the MemoryStore read + filesystem write on the Qt main thread.
         nimbus.sig_export_session_history.emit()
 
+    def _set_ptt_paused(paused: bool) -> None:
+        if nimbus._hotkey is not None:
+            nimbus._hotkey.set_enabled(not paused)
+        if paused:
+            nimbus._tts.stop()
+            nimbus.sig_hide_waveform.emit()
+            nimbus.sig_hide_spinner.emit()
+            nimbus.sig_show_toast.emit("Push-to-talk paused. Uncheck it in the tray menu to resume.", "info")
+        _log("Push-to-talk " + ("paused." if paused else "resumed."))
+
     # Tray construction can raise RuntimeError if the user's Windows
     # has no system tray available (rare — kiosk mode, custom shells,
     # certain VMs). Show a QMessageBox + exit cleanly rather than
@@ -2083,6 +2152,7 @@ if __name__ == "__main__":
             on_quit=_quit_via_tray,
             on_settings=_show_settings,
             on_export_session_history=_export_session_history_via_tray,
+            on_pause_changed=_set_ptt_paused,
         )
     except RuntimeError as exc:
         from PyQt6.QtWidgets import QMessageBox
