@@ -25,7 +25,21 @@ All of the above are verified by `py -3.13 -m hotkey`.
 """
 from unittest.mock import MagicMock
 
+import pytest
 from pynput.keyboard import Key
+from pynput import keyboard
+
+
+class TestParseHotkey:
+    def test_normalizes_supported_combo(self):
+        from hotkey import parse_hotkey
+        assert parse_hotkey("Control + Shift + F2").display == "ctrl+shift+f2"
+
+    @pytest.mark.parametrize("value", ["space", "ctrl+alt", "ctrl+ctrl+space", "ctrl+alt+escape", "alt+space", "ctrl+shift+space"])
+    def test_rejects_unsafe_or_invalid_combo(self, value):
+        from hotkey import parse_hotkey
+        with pytest.raises(ValueError):
+            parse_hotkey(value)
 
 
 def test_hotkey_module_importable():
@@ -55,6 +69,19 @@ class TestStateMachine:
             listener_class=MagicMock(),
         )
         return hk, on_press, on_release
+
+    def test_custom_ctrl_shift_letter_chord_fires(self):
+        """Configured chords use the same order-independent PTT state machine."""
+        from hotkey import PushToTalkHotkey
+        on_press = MagicMock()
+        hk = PushToTalkHotkey(
+            on_press=on_press, on_release=MagicMock(), hotkey="Ctrl+Shift+K",
+            listener_class=MagicMock(),
+        )
+        hk._handle_press(Key.shift)
+        hk._handle_press(Key.ctrl)
+        hk._handle_press(keyboard.KeyCode.from_char("k"))
+        on_press.assert_called_once()
 
     def test_ctrl_alt_space_in_order_fires_on_press(self):
         """Typical order: Ctrl, then Alt, then Space. on_press fires once

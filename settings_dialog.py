@@ -282,6 +282,7 @@ class SettingsDialog(QDialog):
         self._category_widgets: dict[str, QWidget] = {}
         self._realtime_note: QLabel | None = None
         self._draw_checkbox: QCheckBox | None = None
+        self._hotkey_input: QLineEdit | None = None
         self._build_ui()
 
     # ---------- UI construction -----------------------------------------
@@ -317,6 +318,23 @@ class SettingsDialog(QDialog):
             resolve_setting("ANNOTATION_MODE", "off") == "on"
         )
         outer.addWidget(self._draw_checkbox)
+
+        # Global PTT chord. It is saved separately from provider credentials
+        # but uses the same keyring namespace. It takes effect after restart,
+        # because the low-level keyboard listener is installed at startup.
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(QLabel("Push-to-talk hotkey:"))
+        self._hotkey_input = QLineEdit()
+        self._hotkey_input.setPlaceholderText("Ctrl+Alt+Space")
+        self._hotkey_input.setToolTip(
+            "Modifier + key: Ctrl/Alt/Shift with Space, Enter, Tab, A-Z, 0-9, or F1-F12. Takes effect after restart."
+        )
+        self._hotkey_input.setText(resolve_setting("HOTKEY", "ctrl+alt+space"))
+        hotkey_row.addWidget(self._hotkey_input, stretch=1)
+        outer.addLayout(hotkey_row)
+        restart_note = QLabel("Hotkey changes take effect the next time Nimbus starts.")
+        restart_note.setStyleSheet("color: gray; padding-bottom: 2px;")
+        outer.addWidget(restart_note)
 
         self._reveal = QCheckBox("Show keys in plain text (paste-verify)")
         self._reveal.toggled.connect(self._on_reveal_toggled)
@@ -611,6 +629,18 @@ class SettingsDialog(QDialog):
         Ollama is unreachable we skip the check entirely (don't conflate
         "Ollama down" with "incompatible model").
         """
+        # Validate before any compatibility dialogs or keyring writes: an
+        # invalid chord must leave all existing settings untouched.
+        hotkey_value = self._hotkey_input.text().strip() if self._hotkey_input else ""
+        try:
+            from hotkey import parse_hotkey
+            hotkey_value = parse_hotkey(hotkey_value).display
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid hotkey", str(exc))
+            if self._hotkey_input is not None:
+                self._hotkey_input.setFocus()
+            return
+
         # Pre-save compatibility check for Ollama LLM.
         llm_category = next(c for c in _PROVIDER_CATEGORIES if c.category_key == "LLM")
         llm_dropdown = self._dropdowns["LLM"]
@@ -656,6 +686,7 @@ class SettingsDialog(QDialog):
                 "ANNOTATION_MODE",
                 "on" if self._draw_checkbox.isChecked() else "off",
             )
+        keyring.set_password(KEYRING_SERVICE, "HOTKEY", hotkey_value)
         self.accept()
 
     def _confirm_ollama_compat(self, model: str) -> bool:

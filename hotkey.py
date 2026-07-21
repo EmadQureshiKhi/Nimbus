@@ -68,6 +68,8 @@ File order (so `py -3.13 -m hotkey` works):
 from __future__ import annotations
 
 import threading
+import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
 
@@ -88,6 +90,54 @@ class HotkeyState(Enum):
 
     IDLE = "idle"
     RECORDING = "recording"
+
+
+@dataclass(frozen=True)
+class HotkeyCombo:
+    """Validated, normalized push-to-talk chord."""
+    modifiers: frozenset[str]
+    trigger: str
+
+    @property
+    def display(self) -> str:
+        ordered = [m for m in ("ctrl", "alt", "shift") if m in self.modifiers]
+        return "+".join([*ordered, self.trigger])
+
+
+_MODIFIER_ALIASES = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift"}
+_SPECIAL_TRIGGERS = {"space", "enter", "tab"}
+
+
+def parse_hotkey(value: str) -> HotkeyCombo:
+    """Validate a human-readable chord such as ``ctrl+alt+space``.
+
+    Requiring a modifier prevents a Settings typo from turning ordinary typing
+    into push-to-talk. The final trigger may be Space, Enter, Tab, one letter
+    or number, or an F1–F12 key.
+    """
+    tokens = [part.strip().lower() for part in value.split("+") if part.strip()]
+    if len(tokens) < 2:
+        raise ValueError("Use a modifier plus a key, for example Ctrl+Alt+Space.")
+    modifiers = frozenset(_MODIFIER_ALIASES[t] for t in tokens if t in _MODIFIER_ALIASES)
+    triggers = [t for t in tokens if t not in _MODIFIER_ALIASES]
+    if len(modifiers) != len([t for t in tokens if t in _MODIFIER_ALIASES]):
+        raise ValueError("Do not repeat a modifier in the hotkey.")
+    if not modifiers:
+        raise ValueError("Add Ctrl, Alt, or Shift so normal typing stays safe.")
+    if len(triggers) != 1:
+        raise ValueError("Choose exactly one final key, for example Ctrl+Alt+Space.")
+    trigger = triggers[0]
+    if not (
+        trigger in _SPECIAL_TRIGGERS
+        or re.fullmatch(r"[a-z0-9]", trigger)
+        or re.fullmatch(r"f(?:[1-9]|1[0-2])", trigger)
+    ):
+        raise ValueError("Use Space, Enter, Tab, A-Z, 0-9, or F1-F12 as the final key.")
+    if modifiers == frozenset({"alt"}) and trigger == "space":
+        raise ValueError("Alt+Space opens the Windows window menu; add Ctrl or choose another key.")
+    if modifiers == frozenset({"ctrl", "shift"}) and trigger == "space":
+        raise ValueError("Ctrl+Shift+Space conflicts with Excel and Google Sheets; choose another chord.")
+    return HotkeyCombo(modifiers, trigger)
 
 
 # --- PushToTalkHotkey --------------------------------------------------------
@@ -121,6 +171,7 @@ class PushToTalkHotkey:
         self,
         on_press: Callable[[], None],
         on_release: Callable[[], None],
+        hotkey: str = "ctrl+alt+space",
         listener_class=None,
     ) -> None:
         """Wire the hotkey to caller callbacks.
@@ -135,6 +186,7 @@ class PushToTalkHotkey:
                             keyboard listener. Defaults to pynput.keyboard.Listener
                             at construction time so tests can inject MagicMock.
         """
+        self._combo = parse_hotkey(hotkey)
         self._on_press_cb = on_press
         self._on_release_cb = on_release
         self._listener_class = listener_class or keyboard.Listener
@@ -143,6 +195,8 @@ class PushToTalkHotkey:
         self._ctrl_down: bool = False
         self._alt_down: bool = False
         self._space_down: bool = False
+        self._down_modifiers: set[str] = set()
+        self._trigger_down: bool = False
         self._state: HotkeyState = HotkeyState.IDLE
 
         self._listener = None  # set in start(), cleared in stop()
@@ -232,6 +286,33 @@ class PushToTalkHotkey:
         """Space is a single constant in pynput (no left/right variants)."""
         return key == keyboard.Key.space
 
+    def _modifier_for_key(self, key) -> str | None:
+        if self._is_ctrl(key):
+            return "ctrl"
+        if self._is_alt(key):
+            return "alt"
+        if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            return "shift"
+        return None
+
+    def _is_trigger(self, key) -> bool:
+        trigger = self._combo.trigger
+        if trigger == "space":
+            return self._is_space(key)
+        if trigger == "enter":
+            return key in (keyboard.Key.enter, getattr(keyboard.Key, "return", keyboard.Key.enter))
+        if trigger == "tab":
+            return key == keyboard.Key.tab
+        if trigger.startswith("f"):
+            return key == getattr(keyboard.Key, trigger)
+        return getattr(key, "char", "").lower() == trigger
+
+    def _sync_legacy_flags(self) -> None:
+        """Keep default-combo diagnostic fields stable for existing callers."""
+        self._ctrl_down = "ctrl" in self._down_modifiers
+        self._alt_down = "alt" in self._down_modifiers
+        self._space_down = self._trigger_down if self._combo.trigger == "space" else False
+
     def _handle_press(self, key) -> Optional[bool]:
         """Low-level key-down handler called by pynput on its listener thread.
 
@@ -241,19 +322,18 @@ class PushToTalkHotkey:
         """
         fire_press = False
         with self._lock:
-            if self._is_ctrl(key):
-                self._ctrl_down = True
-            elif self._is_alt(key):
-                self._alt_down = True
-            elif self._is_space(key):
-                self._space_down = True
+            modifier = self._modifier_for_key(key)
+            if modifier is not None:
+                self._down_modifiers.add(modifier)
+            elif self._is_trigger(key):
+                self._trigger_down = True
+            self._sync_legacy_flags()
             # Non-hotkey keys: ignored, no state change, no flag touched.
 
             # Check if the combo is now complete.
             if (self._state == HotkeyState.IDLE
-                    and self._ctrl_down
-                    and self._alt_down
-                    and self._space_down):
+                    and self._combo.modifiers.issubset(self._down_modifiers)
+                    and self._trigger_down):
                 self._state = HotkeyState.RECORDING
                 fire_press = True
 
@@ -272,25 +352,24 @@ class PushToTalkHotkey:
         """
         fire_release = False
         with self._lock:
-            is_hotkey_key = (self._is_ctrl(key)
-                             or self._is_alt(key)
-                             or self._is_space(key))
+            modifier = self._modifier_for_key(key)
+            is_hotkey_key = (
+                (modifier is not None and modifier in self._combo.modifiers)
+                or self._is_trigger(key)
+            )
 
             if self._state == HotkeyState.RECORDING and is_hotkey_key:
                 # Any of the 3 released while RECORDING: end the recording.
                 fire_release = True
                 self._state = HotkeyState.IDLE
-                self._ctrl_down = False
-                self._alt_down = False
-                self._space_down = False
+                self._down_modifiers.clear()
+                self._trigger_down = False
             else:
-                # IDLE path: clear the flag for this specific key, if applicable.
-                if self._is_ctrl(key):
-                    self._ctrl_down = False
-                elif self._is_alt(key):
-                    self._alt_down = False
-                elif self._is_space(key):
-                    self._space_down = False
+                if modifier is not None:
+                    self._down_modifiers.discard(modifier)
+                elif self._is_trigger(key):
+                    self._trigger_down = False
+            self._sync_legacy_flags()
 
         if fire_release:
             self._on_release_cb()

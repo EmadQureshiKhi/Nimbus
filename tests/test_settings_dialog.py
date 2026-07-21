@@ -271,6 +271,15 @@ class TestSettingsDialogRender:
         dlg = SettingsDialog()
         assert set(dlg._key_inputs.keys()) == {"LLM", "STT", "TTS"}
 
+    def test_dialog_shows_saved_hotkey(self, qapp, mocker):
+        mocker.patch(
+            "settings_dialog.keyring.get_password",
+            side_effect=lambda _service, name: "ctrl+shift+f2" if name == "HOTKEY" else None,
+        )
+        from settings_dialog import SettingsDialog
+        dlg = SettingsDialog()
+        assert dlg._hotkey_input.text() == "ctrl+shift+f2"
+
     def test_dialog_has_three_signup_buttons(self, qapp, mocker):
         mocker.patch("settings_dialog.keyring.get_password", return_value=None)
         from settings_dialog import SettingsDialog
@@ -426,6 +435,37 @@ class TestSettingsDialogSave:
 
         assert ("nimbus", "CARTESIA_API_KEY") in saved
         assert ("nimbus", "ELEVENLABS_API_KEY") not in saved
+
+    def test_save_persists_normalized_hotkey(self, qapp, mocker, monkeypatch):
+        saved: dict[tuple[str, str], str] = {}
+        monkeypatch.setattr("settings_dialog.keyring.get_password", lambda s, n: None)
+        monkeypatch.setattr(
+            "settings_dialog.keyring.set_password",
+            lambda s, n, v: saved.update({(s, n): v}),
+        )
+        from settings_dialog import SettingsDialog
+        dlg = SettingsDialog()
+        dlg._key_inputs["LLM"].setText("a")
+        dlg._key_inputs["STT"].setText("b")
+        dlg._key_inputs["TTS"].setText("c")
+        dlg._hotkey_input.setText("Control + Shift + F2")
+        dlg._on_save()
+        assert saved[("nimbus", "HOTKEY")] == "ctrl+shift+f2"
+
+    def test_invalid_hotkey_shows_error_and_does_not_save(self, qapp, mocker, monkeypatch):
+        saved: dict[tuple[str, str], str] = {}
+        monkeypatch.setattr("settings_dialog.keyring.get_password", lambda s, n: None)
+        monkeypatch.setattr(
+            "settings_dialog.keyring.set_password",
+            lambda s, n, v: saved.update({(s, n): v}),
+        )
+        error = mocker.patch("settings_dialog.QMessageBox.critical")
+        from settings_dialog import SettingsDialog
+        dlg = SettingsDialog()
+        dlg._hotkey_input.setText("escape")
+        dlg._on_save()
+        error.assert_called_once()
+        assert saved == {}
 
 
 # --- Ollama model dropdown + compat warn -------
