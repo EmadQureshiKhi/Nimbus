@@ -146,18 +146,22 @@ Defaults to 'openai/gpt-4o'. Set MODEL_ID in .env to override."""
 # ── Screen capture ───────────────────────────────────────────────────────────
 
 CANDIDATE_RESOLUTIONS: list[tuple[int, int]] = [
-    (1024, 768),   # 4:3   = 1.333 (legacy displays)
-    (1280, 800),   # 16:10 = 1.600 (most laptops)
-    (1366, 768),   # ~16:9 = 1.779 (external monitors, ultrawide fallback)
+    (1600, 1200),  # 4:3   = 1.333
+    (1920, 1200),  # 16:10 = 1.600
+    (1920, 1080),  # 16:9  = 1.778
 ]
-"""Recommended screenshot resolutions. capture.py picks the
-closest-aspect-ratio pair to the actual monitor to avoid distortion
-(max dimension 1280)."""
+"""High-detail screenshot resolutions used for the initial vision pass.
+
+``capture.py`` also retains the original monitor image for a small, targeted
+verification crop.  The full image keeps enough detail for normal grounding;
+the crop avoids sending an entire 4K desktop again when Nimbus needs to check
+a small control.
+"""
 
 
 # ── Hotkey ───────────────────────────────────────────────────────────────────
 
-HOTKEY: str = os.getenv("HOTKEY", "ctrl+alt+space")
+HOTKEY: str = resolve_setting("HOTKEY", default="ctrl+alt+space")
 """Default push-to-talk hotkey. Ctrl+Alt+Space because:
 
   1. Alt+Space alone conflicts with the Windows window menu + Copilot
@@ -440,9 +444,26 @@ differentiator, but too much context slows the model down."""
 
 # ── Knowledge base (user-uploadable per-app curated docs) ────────────────────
 
-KB_DIR: Path = Path(
+def _resolve_kb_dir(candidate: Path, fallback: Path) -> Path:
+    """Create the knowledge folder, falling back when Documents is blocked.
+
+    Managed Windows profiles can expose ``~/Documents`` but reject child
+    creation with FileNotFoundError. Nimbus must use one consistent writable
+    path for both the tray shortcut and runtime KB recall.
+    """
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+_KB_REQUESTED_DIR = Path(
     os.getenv("KB_DIR", str(Path.home() / "Documents" / "Nimbus Wiki"))
 )
+_KB_FALLBACK_DIR = Path(__file__).resolve().parent / "Nimbus Wiki"
+KB_DIR: Path = _resolve_kb_dir(_KB_REQUESTED_DIR, _KB_FALLBACK_DIR)
 """User drops a single .md file here per app, named to match the .exe
 basename (e.g. ``myapp.exe.md`` for MyApp, ``fusion360.exe.md`` for
 Fusion 360). Nimbus reads it on every PTT and injects as authoritative
@@ -453,7 +474,9 @@ folder) so users can find + edit + delete the files without terminal
 gymnastics. Mirrors memory.py's transparency contract: human-readable,
 hand-editable, no vector DB.
 
-A simple flat layout (one file per app), right-sized for this use case."""
+A simple flat layout (one file per app), right-sized for this use case. If
+Windows blocks the Documents folder, Nimbus uses a visible ``Nimbus Wiki``
+folder beside the application instead."""
 
 KB_RECALL_MAX_CHARS: int = 60_000
 """Max characters of curated KB content to inject per request. ~15K

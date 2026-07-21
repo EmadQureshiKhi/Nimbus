@@ -155,3 +155,15 @@ class TestResolveSetting:
         monkeypatch.setattr(config.keyring, "set_password", boom)
         from config import resolve_setting
         assert resolve_setting("TTS_PROVIDER", default="cartesia") == "elevenlabs"
+
+
+def test_resolve_kb_dir_falls_back_when_documents_cannot_create_child(tmp_path):
+    """A broken/managed Documents path must not break the tray KB shortcut."""
+    from config import _resolve_kb_dir
+
+    blocker = tmp_path / "Documents"
+    blocker.write_text("not a directory", encoding="utf-8")
+    fallback = tmp_path / "Nimbus Wiki"
+
+    assert _resolve_kb_dir(blocker / "Nimbus Wiki", fallback) == fallback
+    assert fallback.is_dir()

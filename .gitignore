@@ -30,6 +30,7 @@ debug_*.png
 scratch_*
 *.log
 exports/
+Nimbus Wiki/
 
 # Model caches (downloaded on first run, large)
 whisper-cache/

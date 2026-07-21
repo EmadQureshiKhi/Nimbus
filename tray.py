@@ -36,7 +36,7 @@ from typing import Callable
 
 from PyQt6.QtCore import QObject
 from PyQt6.QtGui import QAction, QIcon
-from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
+from PyQt6.QtWidgets import QMenu, QMessageBox, QSystemTrayIcon
 
 from config import KB_DIR, MEMORY_DIR
 
@@ -129,8 +129,15 @@ class NimbusTray(QObject):
         anything) get created so the user lands in an empty folder
         rather than an error dialog.
         """
-        path.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(path))
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))
+        except OSError as exc:
+            QMessageBox.warning(
+                None,
+                "Nimbus folder unavailable",
+                f"Nimbus could not open this folder:\n{path}\n\n{exc}",
+            )
 
     def _open_kb_folder(self) -> None:
         self._open_in_explorer(KB_DIR)
