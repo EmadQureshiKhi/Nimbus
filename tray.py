@@ -8,6 +8,7 @@ Menu structure (right-click the tray icon):
     - Settings...                   ← reopen the BYOK keyring dialog
     - Open Knowledge Folder         ← jump to ~/Documents/Nimbus Wiki/
     - Open Memory Folder            ← jump to ~/.nimbus/memory/
+    - Export Session History        ← save the current conversation as Markdown
     - --------
     - Quit Nimbus                   ← clean shutdown via callback
 
@@ -45,8 +46,9 @@ class NimbusTray(QObject):
 
     The icon is shown as soon as ``__init__`` completes. Pass
     ``on_quit`` (called when the user clicks Quit) and
-    ``on_settings`` (called when they click Settings...). Both fire
-    on the Qt main thread.
+    ``on_settings`` (called when they click Settings...) and
+    ``on_export_session_history`` (called when they click Export Session
+    History). All callbacks fire on the Qt main thread.
     """
 
     def __init__(
@@ -54,6 +56,7 @@ class NimbusTray(QObject):
         *,
         on_quit: Callable[[], None],
         on_settings: Callable[[], None],
+        on_export_session_history: Callable[[], None] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -76,6 +79,9 @@ class NimbusTray(QObject):
 
         self._on_quit = on_quit
         self._on_settings = on_settings
+        # Optional for backward compatibility with callers that only expose
+        # Settings + Quit. The production app always supplies this callback.
+        self._on_export_session_history = on_export_session_history or (lambda: None)
 
         self._icon = QSystemTrayIcon(parent=self)
         self._icon.setToolTip("Nimbus — push-to-talk AI buddy")
@@ -102,6 +108,10 @@ class NimbusTray(QObject):
         act_open_mem = QAction("Open Memory Folder", self)
         act_open_mem.triggered.connect(self._open_memory_folder)
         self._menu.addAction(act_open_mem)
+
+        act_export = QAction("Export Session History", self)
+        act_export.triggered.connect(self._on_export_session_history)
+        self._menu.addAction(act_export)
 
         self._menu.addSeparator()
 

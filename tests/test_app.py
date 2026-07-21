@@ -107,6 +107,71 @@ class TestNimbusApp:
         assert app._history == []
         assert app._current_app == "unknown"
 
+    def test_export_session_history_writes_conversation_and_recent_memory(
+        self, mocker, tmp_path
+    ):
+        """Exports current in-memory turns plus MemoryStore's bounded recall."""
+        app = self._make_app(mocker)
+        app._current_app = "EXCEL.EXE"
+        app._current_title = "Budget - Excel"
+        app._history = [
+            {"role": "user", "content": [{"type": "text", "text": "freeze panes"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "open View."}]},
+        ]
+        app._memory.recall.return_value = "## Earlier turn\nResponse: Use Freeze Panes."
+
+        path = app._export_session_history(tmp_path)
+
+        assert path.parent == tmp_path
+        assert path.name.startswith("nimbus-session-")
+        assert path.suffix == ".md"
+        exported = path.read_text(encoding="utf-8")
+        assert "# Nimbus session history" in exported
+        assert "Current app: EXCEL.EXE" in exported
+        assert "### User" in exported
+        assert "freeze panes" in exported
+        assert "### Assistant" in exported
+        assert "open View." in exported
+        assert "## Recent per-app memory (EXCEL.EXE)" in exported
+        assert "Response: Use Freeze Panes." in exported
+        app._memory.recall.assert_called_once_with("EXCEL.EXE")
+
+    def test_export_signal_dispatches_to_main_thread_slot(self, mocker, tmp_path):
+        """The tray-facing signal, rather than the tray callback, owns export."""
+        app = self._make_app(mocker)
+        export_mock = mocker.patch.object(app, "_export_session_history")
+        export_mock.return_value = tmp_path / "nimbus-session.md"
+
+        app.sig_export_session_history.emit()
+
+        export_mock.assert_called_once_with()
+
+    def test_export_uses_fallback_when_documents_is_not_writable(
+        self, mocker, tmp_path
+    ):
+        """Managed Windows profiles can deny Documents even when it exists."""
+        from pathlib import Path
+
+        app = self._make_app(mocker)
+        app._memory.recall.return_value = ""
+        blocked_dir = tmp_path / "blocked-documents"
+        fallback_dir = tmp_path / "fallback-exports"
+        mocker.patch("app.SESSION_EXPORT_DIR", blocked_dir)
+        mocker.patch("app.SESSION_EXPORT_FALLBACK_DIR", fallback_dir)
+        real_write_text = Path.write_text
+
+        def write_text(path, *args, **kwargs):
+            if path.parent == blocked_dir:
+                raise FileNotFoundError("Documents is unavailable")
+            return real_write_text(path, *args, **kwargs)
+
+        mocker.patch.object(Path, "write_text", new=write_text)
+
+        path = app._export_session_history()
+
+        assert path.parent == fallback_dir
+        assert path.is_file()
+
     def test_handle_press_starts_recording(self, mocker):
         app = self._make_app(mocker)
         mocker.patch("app.get_foreground_app", return_value=("EXCEL.EXE", "Sheet1"))

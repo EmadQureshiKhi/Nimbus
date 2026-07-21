@@ -23,8 +23,10 @@ import signal
 import sys
 import threading
 from ctypes import wintypes
+from datetime import datetime
+from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QStandardPaths, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 import kb
@@ -79,6 +81,25 @@ _SENTENCE_END_RE = re.compile(r"[.!?]\s")
 
 _MAX_HISTORY_EXCHANGES = 10
 
+def _documents_dir() -> Path:
+    """Return Windows' writable Documents known folder.
+
+    ``Path.home() / 'Documents'`` is wrong on installations where OneDrive
+    redirects the Documents known folder. Qt asks Windows for the resolved,
+    writable location and keeps the fallback for unusual headless setups.
+    """
+    resolved = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DocumentsLocation
+    )
+    return Path(resolved) if resolved else Path.home() / "Documents"
+
+
+SESSION_EXPORT_DIR = _documents_dir()
+"""Resolved Windows Documents folder for user-requested Markdown exports."""
+
+SESSION_EXPORT_FALLBACK_DIR = Path(__file__).resolve().parent / "exports"
+"""Recoverable export location when Windows blocks the Documents folder."""
+
 _REUSE_THRESHOLD_PX = 150
 """Max cursor movement between press and release for reusing press-time
 captures. Raised from 50 → 150 after real-session logs
@@ -100,6 +121,26 @@ def flush_sentences(buffer: str) -> tuple[list[str], str]:
         sentences.append(buffer[:end].strip())
         buffer = buffer[end:]
     return sentences, buffer
+
+
+def _history_message_text(message: dict) -> str:
+    """Return the human-readable text from one in-memory history message.
+
+    Nimbus stores OpenAI-style content blocks in ``_history``. Exporting only
+    text deliberately avoids writing image payloads to the user's Documents
+    folder while remaining tolerant of a simple string-shaped test message.
+    """
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ).strip()
 
 
 # --- Grid-locator fallback (Ollama pixel-pointing) --------------------
@@ -324,6 +365,10 @@ class NimbusApp(QObject):
     # Clear all teaching shapes (fired at the start of each press so stale
     # annotations never survive a no-speech / cancelled / errored turn).
     sig_clear_annotations = pyqtSignal()
+    # Tray callbacks may evolve beyond the Qt main thread. Route session
+    # exports through a signal so MemoryStore reads and the file write always
+    # happen in this QObject's main-thread slot.
+    sig_export_session_history = pyqtSignal()
 
     def __init__(
         self,
@@ -398,6 +443,7 @@ class NimbusApp(QObject):
         self.sig_hide_spinner.connect(self._on_hide_spinner)
         self.sig_show_annotations.connect(self._on_show_annotations)
         self.sig_clear_annotations.connect(self._on_clear_annotations)
+        self.sig_export_session_history.connect(self._on_export_session_history)
 
     def start(self) -> None:
         """Initialize overlay + hotkey and begin listening.
@@ -1264,6 +1310,81 @@ class NimbusApp(QObject):
         if self._overlay:
             self._overlay.clear_all_annotations()
 
+    # --- Session-history export (Qt main thread) ----------------------------
+
+    def _export_session_history(self, export_dir: Path | None = None) -> Path:
+        """Write the live conversation and current app's recent memory to Markdown.
+
+        ``MemoryStore.recall`` remains the only way this feature reads
+        persistent memory. The conversation itself is intentionally sourced
+        from the current in-process ``_history`` list, which is reset when
+        Nimbus restarts. ``export_dir`` is a test hook; production writes to
+        the user's Documents folder.
+        """
+        exported_at = datetime.now()
+        # Use the normal bounded recall API rather than reaching into the
+        # markdown file directly. This keeps the memory module authoritative
+        # for naming, truncation, and future storage changes.
+        memory_context = self._memory.recall(self._current_app)
+
+        lines = [
+            "# Nimbus session history",
+            "",
+            f"Exported: {exported_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Current app: {self._current_app}",
+            f"Window: {self._current_title or '(none)'}",
+            "",
+            "## Conversation",
+            "",
+        ]
+        if self._history:
+            for message in self._history:
+                role = str(message.get("role", "assistant")).title()
+                text = _history_message_text(message) or "(no text content)"
+                lines.extend((f"### {role}", "", text, ""))
+        else:
+            lines.extend(("(No messages in this Nimbus session yet.)", ""))
+
+        lines.extend((
+            f"## Recent per-app memory ({self._current_app})",
+            "",
+            memory_context or "(No saved memory for this app yet.)",
+            "",
+        ))
+        filename = f"nimbus-session-{exported_at.strftime('%Y%m%d-%H%M%S-%f')}.md"
+        contents = "\n".join(lines)
+
+        def write_to(destination: Path) -> Path:
+            destination.mkdir(parents=True, exist_ok=True)
+            path = destination / filename
+            path.write_text(contents, encoding="utf-8")
+            return path
+
+        destination = Path(export_dir) if export_dir is not None else SESSION_EXPORT_DIR
+        try:
+            return write_to(destination)
+        except OSError as documents_error:
+            # Explicit destinations are test/caller-controlled and should
+            # surface their failure. The user-facing default gets a durable
+            # fallback when Windows security software or a managed profile
+            # denies writes to Documents.
+            if export_dir is not None:
+                raise
+            fallback_path = write_to(SESSION_EXPORT_FALLBACK_DIR)
+            _log(
+                "WARN: Documents export unavailable "
+                f"({type(documents_error).__name__}); saved to {fallback_path}"
+            )
+            return fallback_path
+
+    def _on_export_session_history(self) -> None:
+        """Export slot, invoked through ``sig_export_session_history`` only."""
+        try:
+            path = self._export_session_history()
+            _log(f"Session history exported: {path}")
+        except Exception as exc:
+            _log(f"ERROR: Session-history export failed — {type(exc).__name__}: {exc}")
+
 
 _T0 = __import__("time").time()
 
@@ -1740,6 +1861,11 @@ if __name__ == "__main__":
         nimbus.stop()
         qt_app.quit()
 
+    def _export_session_history_via_tray() -> None:
+        # Keep the tray action as a thin dispatcher. The NimbusApp slot owns
+        # the MemoryStore read + filesystem write on the Qt main thread.
+        nimbus.sig_export_session_history.emit()
+
     # Tray construction can raise RuntimeError if the user's Windows
     # has no system tray available (rare — kiosk mode, custom shells,
     # certain VMs). Show a QMessageBox + exit cleanly rather than
@@ -1748,6 +1874,7 @@ if __name__ == "__main__":
         tray = NimbusTray(
             on_quit=_quit_via_tray,
             on_settings=_show_settings,
+            on_export_session_history=_export_session_history_via_tray,
         )
     except RuntimeError as exc:
         from PyQt6.QtWidgets import QMessageBox

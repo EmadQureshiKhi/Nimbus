@@ -25,18 +25,20 @@ def test_tray_module_importable():
 
 
 class TestNimbusTrayMenu:
-    """The tray menu must have exactly 4 visible actions in this order:
-    Settings... / Open Knowledge Folder / Open Memory Folder / Quit
-    Nimbus. The Quit action's callback must be the on_quit kwarg passed
-    at construction time."""
+    """The tray menu exposes settings, folders, session export, and quit."""
 
-    def test_menu_has_four_actions_in_order(self, qapp, mocker):
-        """The 4 visible menu items + 1 separator. Verified by reading
+    def test_menu_has_five_actions_in_order(self, qapp, mocker):
+        """The 5 visible menu items + 1 separator. Verified by reading
         QMenu.actions() in order."""
         from tray import NimbusTray
         on_quit = mocker.MagicMock()
         on_settings = mocker.MagicMock()
-        t = NimbusTray(on_quit=on_quit, on_settings=on_settings)
+        on_export = mocker.MagicMock()
+        t = NimbusTray(
+            on_quit=on_quit,
+            on_settings=on_settings,
+            on_export_session_history=on_export,
+        )
 
         actions = [a for a in t._menu.actions() if not a.isSeparator()]
         labels = [a.text() for a in actions]
@@ -44,8 +46,24 @@ class TestNimbusTrayMenu:
             "Settings...",
             "Open Knowledge Folder",
             "Open Memory Folder",
+            "Export Session History",
             "Quit Nimbus",
         ]
+
+    def test_export_action_triggers_export_callback(self, qapp, mocker):
+        from tray import NimbusTray
+        on_export = mocker.MagicMock()
+        t = NimbusTray(
+            on_quit=mocker.MagicMock(),
+            on_settings=mocker.MagicMock(),
+            on_export_session_history=on_export,
+        )
+
+        action = next(
+            a for a in t._menu.actions() if a.text() == "Export Session History"
+        )
+        action.trigger()
+        on_export.assert_called_once()
 
     def test_quit_action_triggers_on_quit_callback(self, qapp, mocker):
         from tray import NimbusTray
